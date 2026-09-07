@@ -837,7 +837,7 @@ func (c *Client) handleFetch(seqNum uint32) error {
 						return fmt.Errorf("in section-binary: %w", err)
 					}
 					if offset != nil {
-						binSection.Partial = &imap.SectionPartial{Offset: int64(*offset)}
+						binSection.Partial = &imap.SectionPartial{Offset: *offset}
 					}
 					section = binSection
 				}
@@ -1451,18 +1451,21 @@ func readSectionSpec(dec *imapwire.Decoder) (*imap.FetchItemBodySection, error) 
 		return nil, err
 	}
 	if offset != nil {
-		section.Partial = &imap.SectionPartial{Offset: int64(*offset)}
+		section.Partial = &imap.SectionPartial{Offset: *offset}
 	}
 
 	return &section, nil
 }
 
-func readPartialOffset(dec *imapwire.Decoder) (*uint32, error) {
+// readPartialOffset reads the origin octet a server echoes after a partial
+// section. The request's offset is a number64 (RFC 9051 §9, partial), so a
+// server answering one at or above 2^32 has to echo more than 32 bits.
+func readPartialOffset(dec *imapwire.Decoder) (*int64, error) {
 	if !dec.Special('<') {
 		return nil, nil
 	}
-	var offset uint32
-	if !dec.ExpectNumber(&offset) || !dec.ExpectSpecial('>') {
+	var offset int64
+	if !dec.ExpectNumber64(&offset) || !dec.ExpectSpecial('>') {
 		return nil, dec.Err()
 	}
 	return &offset, nil

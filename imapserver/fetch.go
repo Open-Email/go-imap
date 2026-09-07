@@ -543,8 +543,11 @@ func writeItemBodySection(enc *imapwire.Encoder, section *imap.FetchItemBodySect
 		}
 	}
 	enc.Special(']')
+	// The request carries a number64 offset (RFC 9051 §9, partial), so echo
+	// it whole: the client matches the response to its request by this
+	// number, and the low 32 bits of a larger offset name the wrong origin.
 	if partial := section.Partial; partial != nil {
-		enc.Special('<').Number(uint32(partial.Offset)).Special('>')
+		enc.Special('<').Number64(partial.Offset).Special('>')
 	}
 }
 
@@ -559,10 +562,10 @@ func (w *FetchResponseWriter) WriteBinarySection(section *imap.FetchItemBinarySe
 	enc.Atom("BINARY").Special('[')
 	writeSectionPart(enc, section.Part)
 	enc.Special(']')
-	// RFC 3516 §4.2.2: a partial BINARY response MUST echo the <origin octet>,
-	// e.g. BINARY[]<0> ~{n}. Mirror the BODY[...] path above.
+	// RFC 3516 §4.2 gives a partial BINARY the semantics of a partial BODY,
+	// so echo the origin octet the same way, e.g. BINARY[]<0> ~{n}.
 	if partial := section.Partial; partial != nil {
-		enc.Special('<').Number(uint32(partial.Offset)).Special('>')
+		enc.Special('<').Number64(partial.Offset).Special('>')
 	}
 	enc.SP()
 	enc.Special('~') // indicates literal8
