@@ -593,6 +593,9 @@ func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
 			if item.Literal.Size() > max {
 				return errLiteralTooLarge
 			}
+			// Start non-nil: a zero-length literal writes nothing, and the Find
+			// helpers return nil only for a section the response does not carry.
+			b = []byte{}
 			bounded := &boundedBuf{buf: &b, max: max}
 			_, err := io.Copy(bounded, item.Literal)
 			if err != nil {
@@ -610,6 +613,9 @@ func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
 			if item.Literal.Size() > max {
 				return errLiteralTooLarge
 			}
+			// Start non-nil: a zero-length literal writes nothing, and the Find
+			// helpers return nil only for a section the response does not carry.
+			b = []byte{}
 			bounded := &boundedBuf{buf: &b, max: max}
 			_, err := io.Copy(bounded, item.Literal)
 			if err != nil {
