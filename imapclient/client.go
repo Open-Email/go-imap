@@ -1280,8 +1280,10 @@ func (c *Client) handleVanished() error {
 	// Check if there's a pending SELECT command
 	cmd := findPendingCmdByType[*SelectCommand](c)
 	if cmd != nil && data.Earlier {
-		// VANISHED (EARLIER) during SELECT should populate SelectData
-		cmd.data.Vanished = data.UIDs
+		// VANISHED (EARLIER) during SELECT should populate SelectData.
+		// Accumulate: a resynchronization can arrive in more than one
+		// response, and each carries its own part of the expunged set.
+		cmd.data.Vanished = append(cmd.data.Vanished, data.UIDs...)
 	} else if handler := c.options.unilateralDataHandler().Vanished; handler != nil {
 		handler(&data)
 	}
