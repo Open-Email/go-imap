@@ -135,3 +135,25 @@ func newQResyncTestConn(t *testing.T) *roConn {
 
 	return rc
 }
+
+// "$" (RFC 5182) names the last SEARCH result, which is a set of UIDs, so it
+// cannot stand in for the known-sequence-set half of seq-match-data. The server
+// has to refuse it and stay on the connection.
+func TestSelectQResyncSeqMatchSearchRes(t *testing.T) {
+	rc := newQResyncTestConn(t)
+
+	rc.send("a2 ENABLE QRESYNC")
+	rc.readUntilTag("a2")
+
+	rc.send("a3 SELECT INBOX (QRESYNC (1 1 ($ 100:105)))")
+	resp := rc.readUntilTag("a3")
+	if tagged := resp[len(resp)-1]; !strings.HasPrefix(tagged, "a3 BAD") {
+		t.Errorf("SELECT with \"$\" in seq-match-data = %q, want BAD:\n\t%s", tagged, strings.Join(resp, "\n\t"))
+	}
+
+	rc.send("a4 NOOP")
+	resp = rc.readUntilTag("a4")
+	if tagged := resp[len(resp)-1]; !strings.HasPrefix(tagged, "a4 OK") {
+		t.Errorf("NOOP after the refused SELECT = %q, want OK", tagged)
+	}
+}

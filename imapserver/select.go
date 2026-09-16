@@ -72,8 +72,11 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 
 							if seqMatch {
 								err := dec.ExpectList(func() error {
-									var seqNums, uids imap.UIDSet
-									if !dec.ExpectUIDSet(&seqNums) || !dec.ExpectSP() || !dec.ExpectUIDSet(&uids) {
+									// seq-match-data is "known-sequence-set SP known-uid-set":
+									// the first half is sequence numbers, not UIDs.
+									var seqNums imap.SeqSet
+									var uids imap.UIDSet
+									if !dec.ExpectSeqSet(&seqNums) || !dec.ExpectSP() || !dec.ExpectUIDSet(&uids) {
 										return dec.Err()
 									}
 									qresyncData.SeqMatch = &imap.QResyncSeqMatch{

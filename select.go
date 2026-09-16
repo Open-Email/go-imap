@@ -16,8 +16,12 @@ type QResyncData struct {
 }
 
 // QResyncSeqMatch contains sequence match data for the QRESYNC parameter.
+//
+// RFC 7162 §3.2.5 defines seq-match-data as "known-sequence-set SP
+// known-uid-set": SeqNums holds the sequence numbers the client knows, and UIDs
+// the UIDs they map to.
 type QResyncSeqMatch struct {
-	SeqNums UIDSet
+	SeqNums SeqSet
 	UIDs    UIDSet
 }
 

@@ -165,3 +165,25 @@ func TestStore_Modified(t *testing.T) {
 		}
 	})
 }
+
+// TestStore_ModifiedReturnsCopy verifies that Modified hands out a copy: a
+// caller that edits the set it got back, as it might to work through the
+// conflicts, must not change what the command reports afterwards.
+func TestStore_ModifiedReturnsCopy(t *testing.T) {
+	cmd, err := runStoreModified(t, imap.UIDSetNum(10, 11, 12),
+		"OK [MODIFIED 11,12] Conditional STORE completed")
+	if err != nil {
+		t.Errorf("Collect() = %v, want nil for OK [MODIFIED]", err)
+	}
+
+	modified, ok := cmd.Modified().(imap.UIDSet)
+	if !ok || len(modified) == 0 {
+		t.Fatalf("Modified() = %v, want a non-empty imap.UIDSet", cmd.Modified())
+	}
+	want := modified.String()
+
+	modified[0].Start = 99
+	if got := cmd.Modified().String(); got != want {
+		t.Errorf("Modified() = %v after the caller edited an earlier result, want %v", got, want)
+	}
+}
