@@ -84,6 +84,16 @@ func readRespCodeModified(dec *imapwire.Decoder, cmd command) (imap.NumSet, erro
 // the precondition. In the expunged-message case the server reports MODIFIED on
 // a NO completion: Modified is still populated, and Close/Collect return the
 // corresponding *imap.Error.
+//
+// The returned set is a copy: mutating it does not disturb the command, so a
+// later call reports the same set.
 func (cmd *FetchCommand) Modified() imap.NumSet {
-	return cmd.modified
+	switch set := cmd.modified.(type) {
+	case imap.SeqSet:
+		return append(imap.SeqSet(nil), set...)
+	case imap.UIDSet:
+		return append(imap.UIDSet(nil), set...)
+	default:
+		return cmd.modified
+	}
 }
