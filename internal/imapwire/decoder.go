@@ -799,6 +799,23 @@ func (dec *Decoder) ExpectUIDSet(ptr *imap.UIDSet) bool {
 	return ok
 }
 
+// ExpectSeqSet reads a set of message sequence numbers.
+//
+// "$" (RFC 5182) names the last SEARCH result, which is a set of UIDs, so it
+// is refused here instead of being returned as an empty sequence set.
+func (dec *Decoder) ExpectSeqSet(ptr *imap.SeqSet) bool {
+	var numSet imap.NumSet
+	if !dec.ExpectNumSet(NumKindSeq, &numSet) {
+		return false
+	}
+	seqSet, ok := numSet.(imap.SeqSet)
+	if !ok {
+		return dec.returnErr(&DecoderExpectError{Message: `expected sequence-set, got "$"`})
+	}
+	*ptr = seqSet
+	return true
+}
+
 func isNumSetChar(ch byte) bool {
 	return ch == '*' || IsAtomChar(ch)
 }
