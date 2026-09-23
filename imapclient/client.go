@@ -923,9 +923,6 @@ func (c *Client) readResponseTagged(tag, typ string) (startTLS *startTLSCommand,
 				cmd.data.UIDValidity = uidValidity
 			}
 		case "COPYUID":
-			if !c.dec.ExpectSP() {
-				return nil, c.dec.Err()
-			}
 			data, err := readRespCodeCopyUID(c.dec)
 			if err != nil {
 				return nil, fmt.Errorf("in resp-code-copy: %w", err)
@@ -1091,9 +1088,6 @@ func (c *Client) readResponseData(typ string) error {
 					cmd.data.UIDValidity = uidValidity
 				}
 			case "COPYUID":
-				if !c.dec.ExpectSP() {
-					return c.dec.Err()
-				}
 				data, err := readRespCodeCopyUID(c.dec)
 				if err != nil {
 					return fmt.Errorf("in resp-code-copy: %w", err)

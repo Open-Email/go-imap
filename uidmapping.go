@@ -14,6 +14,17 @@ type UIDPairRange struct {
 	Dest   UIDRange
 }
 
+// cardinality returns zero for malformed ranges, without unsigned subtraction
+// underflow or allowing iteration past the destination's last UID.
+func (pair UIDPairRange) cardinality() uint64 {
+	if pair.Source.Start == 0 || pair.Dest.Start == 0 ||
+		pair.Source.Stop < pair.Source.Start || pair.Dest.Stop < pair.Dest.Start ||
+		pair.Source.Stop-pair.Source.Start != pair.Dest.Stop-pair.Dest.Start {
+		return 0
+	}
+	return uint64(pair.Source.Stop) - uint64(pair.Source.Start) + 1
+}
+
 // UIDMapping is a COPYUID mapping in copying order (RFC 9051 section 7.1).
 // Unlike UIDSet, it never sorts either side independently. Ranges keep memory
 // proportional to the wire representation, even for billions of mapped UIDs.
@@ -36,8 +47,13 @@ func (m *UIDMapping) Add(source, dest UID) {
 
 // All yields the pairs of a valid mapping in copying order without allocating
 // an expanded list. The caller can stop iteration early, including on huge ranges.
+// If Cardinality returns zero, All yields no pairs. Use Validate to also check
+// for repeated UIDs.
 func (m UIDMapping) All() iter.Seq2[UID, UID] {
 	return func(yield func(UID, UID) bool) {
+		if m.Cardinality() == 0 {
+			return
+		}
 		for _, pair := range m {
 			for n := uint64(pair.Source.Start); n <= uint64(pair.Source.Stop); n++ {
 				if !yield(UID(n), UID(uint64(pair.Dest.Start)+n-uint64(pair.Source.Start))) {
@@ -49,10 +65,17 @@ func (m UIDMapping) All() iter.Seq2[UID, UID] {
 }
 
 // Cardinality returns the number of pairs in a valid mapping without expanding it.
+// It returns zero for malformed ranges or a total exceeding the UID space.
+// This check takes O(r) time and no allocations; use Validate to also check
+// for repeated UIDs.
 func (m UIDMapping) Cardinality() uint64 {
 	var count uint64
 	for _, pair := range m {
-		count += uint64(pair.Source.Stop) - uint64(pair.Source.Start) + 1
+		n := pair.cardinality()
+		if n == 0 || count > uint64(^UID(0))-n {
+			return 0
+		}
+		count += n
 	}
 	return count
 }
@@ -66,9 +89,7 @@ func (m UIDMapping) Validate() error {
 	}
 	ranges := make([]UIDRange, len(m))
 	for i, pair := range m {
-		if pair.Source.Start == 0 || pair.Dest.Start == 0 ||
-			pair.Source.Stop < pair.Source.Start || pair.Dest.Stop < pair.Dest.Start ||
-			pair.Source.Stop-pair.Source.Start != pair.Dest.Stop-pair.Dest.Start {
+		if pair.cardinality() == 0 {
 			return fmt.Errorf("imap: invalid UID mapping range %d", i)
 		}
 	}
