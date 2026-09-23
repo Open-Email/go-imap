@@ -43,3 +43,38 @@ func TestUIDMappingValidation(t *testing.T) {
 		}
 	}
 }
+
+// Public range literals can bypass Add and Validate. Accessors must not wrap
+// arithmetic, yield zero UIDs, or expose a prefix of a malformed mapping.
+func TestUIDMappingMalformedRangeAccessors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mapping imap.UIDMapping
+	}{
+		{"reversed source", imap.UIDMapping{{Source: imap.UIDRange{4, 1}, Dest: imap.UIDRange{10, 13}}}},
+		{"reversed destination", imap.UIDMapping{{Source: imap.UIDRange{1, 4}, Dest: imap.UIDRange{13, 10}}}},
+		{"zero source", imap.UIDMapping{{Source: imap.UIDRange{0, 1}, Dest: imap.UIDRange{10, 11}}}},
+		{"zero destination", imap.UIDMapping{{Source: imap.UIDRange{1, 2}, Dest: imap.UIDRange{0, 1}}}},
+		{"short destination", imap.UIDMapping{{Source: imap.UIDRange{1, 3}, Dest: imap.UIDRange{10, 11}}}},
+		{"long destination", imap.UIDMapping{{Source: imap.UIDRange{1, 2}, Dest: imap.UIDRange{10, 12}}}},
+		{"destination overflow", imap.UIDMapping{{Source: imap.UIDRange{1, 2}, Dest: imap.UIDRange{4294967295, 4294967295}}}},
+		{"invalid suffix", imap.UIDMapping{
+			{Source: imap.UIDRange{1, 1}, Dest: imap.UIDRange{10, 10}},
+			{Source: imap.UIDRange{4, 1}, Dest: imap.UIDRange{11, 14}},
+		}},
+		{"exceeds UID space", imap.UIDMapping{
+			{Source: imap.UIDRange{1, 4294967295}, Dest: imap.UIDRange{1, 4294967295}},
+			{Source: imap.UIDRange{1, 1}, Dest: imap.UIDRange{1, 1}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if count := tc.mapping.Cardinality(); count != 0 {
+				t.Errorf("malformed mapping cardinality = %d, want 0", count)
+			}
+			for source, dest := range tc.mapping.All() {
+				t.Errorf("malformed mapping yielded %d -> %d", source, dest)
+				break // A broken implementation must not expand a huge range.
+			}
+		})
+	}
+}
