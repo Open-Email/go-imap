@@ -926,21 +926,17 @@ func (c *Client) readResponseTagged(tag, typ string) (startTLS *startTLSCommand,
 			if !c.dec.ExpectSP() {
 				return nil, c.dec.Err()
 			}
-			uidValidity, srcUIDs, dstUIDs, err := readRespCodeCopyUID(c.dec)
+			data, err := readRespCodeCopyUID(c.dec)
 			if err != nil {
 				return nil, fmt.Errorf("in resp-code-copy: %w", err)
 			}
 			switch cmd := cmd.(type) {
 			case *CopyCommand:
-				cmd.data.UIDValidity = uidValidity
-				cmd.data.SourceUIDs = srcUIDs
-				cmd.data.DestUIDs = dstUIDs
+				cmd.data = data
 			case *MoveCommand:
 				// This can happen when Client.Move falls back to COPY +
 				// STORE + EXPUNGE
-				cmd.data.UIDValidity = uidValidity
-				cmd.data.SourceUIDs = srcUIDs
-				cmd.data.DestUIDs = dstUIDs
+				cmd.data = MoveData(data)
 			}
 		case "READ-ONLY": // RFC 3501 / RFC 4314 §5.2
 			if cmd, ok := cmd.(*SelectCommand); ok {
@@ -1098,14 +1094,12 @@ func (c *Client) readResponseData(typ string) error {
 				if !c.dec.ExpectSP() {
 					return c.dec.Err()
 				}
-				uidValidity, srcUIDs, dstUIDs, err := readRespCodeCopyUID(c.dec)
+				data, err := readRespCodeCopyUID(c.dec)
 				if err != nil {
 					return fmt.Errorf("in resp-code-copy: %w", err)
 				}
 				if cmd := findPendingCmdByType[*MoveCommand](c); cmd != nil {
-					cmd.data.UIDValidity = uidValidity
-					cmd.data.SourceUIDs = srcUIDs
-					cmd.data.DestUIDs = dstUIDs
+					cmd.data = MoveData(data)
 				}
 			case "HIGHESTMODSEQ":
 				var modSeq uint64
