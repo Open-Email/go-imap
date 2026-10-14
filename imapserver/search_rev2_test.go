@@ -380,3 +380,33 @@ func TestUpdateWriterRev2OnlyServerSendsOldNameWithoutEnable(t *testing.T) {
 		t.Fatalf("rev2-only unsolicited LIST did not carry OLDNAME:\n%s", resp)
 	}
 }
+
+// RFC 5267 §4.2 / RFC 4731 §3.1 / RFC 4466 §2.6.2:
+// search-correlator = "(" "TAG" SP tag-string ")" where tag-string = string
+// (quoted / literal), matching ESEARCH (* ESEARCH (TAG "t...") ...).
+func TestESortTagCorrelatorIsString(t *testing.T) {
+	rc := newSearchRev2Conn(t, imap.CapSet{
+		imap.CapIMAP4rev1: {},
+		imap.CapSort:      {},
+		imap.CapESort:     {},
+	})
+	rc.appendOne("one")
+	rc.appendOne("two")
+	rc.do("SELECT INBOX")
+
+	resp := rc.do("UID SORT RETURN (MIN MAX COUNT ALL) (ARRIVAL) UTF-8 ALL")
+	var esortLine string
+	for _, line := range strings.Split(resp, "\r\n") {
+		if strings.HasPrefix(line, "* ESORT ") {
+			esortLine = line
+			break
+		}
+	}
+	if esortLine == "" {
+		t.Fatalf("expected * ESORT response line, got:\n%s", resp)
+	}
+	if !strings.Contains(esortLine, `(TAG "t`) {
+		t.Fatalf("ESORT TAG correlator must be a quoted string (RFC 4466 §2.6.2), got: %q", esortLine)
+	}
+}
+
