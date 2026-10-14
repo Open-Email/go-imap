@@ -110,11 +110,6 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 	// rev2-only client with no results at all — §6.4.4 tells it to ignore
 	// SEARCH responses, so the mismatch is silent rather than a parse error.
 	//
-	// handleSort already applies exactly this rule to its own response form
-	// (sort.go: `c.enabledHas(imap.CapIMAP4rev2) || extended`). This brings the
-	// command rev2 actually specifies into line with the extension that copied
-	// it.
-	//
 	// Gating on the ENABLED set, never the advertised one, is what keeps this
 	// invisible to IMAP4rev1 clients: a server may advertise IMAP4rev2 alongside
 	// IMAP4rev1, and a client that never sent ENABLE keeps receiving the rev1
