@@ -207,9 +207,6 @@ func (c *Client) handleSearch() error {
 }
 
 func (c *Client) handleESearch() error {
-	if !c.dec.ExpectSP() {
-		return c.dec.Err()
-	}
 	tag, data, allRaw, isUID, err := readESearchResponse(c.dec)
 	if err != nil {
 		return err
@@ -406,6 +403,9 @@ func flagSearchKey(flag imap.Flag) string {
 
 func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchData, allRaw string, isUID bool, err error) {
 	data = &imap.SearchData{}
+	if !dec.SP() {
+		return "", data, "", false, nil
+	}
 	if dec.Special('(') { // search-correlator
 		// RFC 7377 §2.1: the correlator carries TAG plus, for multi-mailbox
 		// results, MAILBOX and UIDVALIDITY — all inside the same parentheses.
@@ -437,15 +437,16 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 		if !dec.ExpectSpecial(')') {
 			return "", nil, "", false, dec.Err()
 		}
+		if !dec.SP() {
+			return tag, data, "", false, nil
+		}
 	}
 
 	var name string
-	if !dec.SP() {
-		return tag, data, "", false, nil
-	} else if !dec.ExpectAtom(&name) {
+	if !dec.ExpectAtom(&name) {
 		return "", nil, "", false, dec.Err()
 	}
-	isUID = name == "UID"
+	isUID = strings.EqualFold(name, "UID")
 
 	if isUID {
 		if !dec.SP() {
