@@ -2,6 +2,7 @@ package imapnum
 
 import (
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -722,3 +723,49 @@ func TestNumSetAddNumRangeSet(t *testing.T) {
 		}
 	}
 }
+
+// RFC 5267 §3.2: "A range IS NOT ordered; a range of 10:12 is completely
+// equivalent to 12:10." Comma-separated elements preserve wire order while
+// each individual range expands in ascending order.
+func TestParseOrderedNums(t *testing.T) {
+	tests := []struct {
+		in     string
+		maxLen int
+		want   []uint32
+		ok     bool
+	}{
+		{"", 10, nil, true},
+		{"5", 10, []uint32{5}, true},
+		{"3,2,1", 10, []uint32{3, 2, 1}, true},
+		{"10:12", 10, []uint32{10, 11, 12}, true},
+		{"12:10", 10, []uint32{10, 11, 12}, true},
+		{"30,12:10,5", 10, []uint32{30, 10, 11, 12, 5}, true},
+		{"15,10:12,3:1,20", 10, []uint32{15, 10, 11, 12, 1, 2, 3, 20}, true},
+		{"1:3", 3, []uint32{1, 2, 3}, true},
+		{"3:1", 3, []uint32{1, 2, 3}, true},
+		{"1:4", 3, nil, false},
+		{"4:1", 3, nil, false},
+		{"0", 10, nil, false},
+		{"0:2", 10, nil, false},
+		{"2:0", 10, nil, false},
+		{"1:*", 10, nil, false},
+	}
+
+	for _, tc := range tests {
+		got, err := ParseOrderedNums(tc.in, tc.maxLen)
+		if !tc.ok {
+			if err == nil {
+				t.Errorf("ParseOrderedNums(%q, %d) = %v, want error", tc.in, tc.maxLen, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseOrderedNums(%q, %d) unexpected error: %v", tc.in, tc.maxLen, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("ParseOrderedNums(%q, %d) = %v, want %v", tc.in, tc.maxLen, got, tc.want)
+		}
+	}
+}
+
