@@ -1,11 +1,7 @@
 package imapclient
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/internal/imapnum"
 	"github.com/emersion/go-imap/v2/internal/imapwire"
 )
 
@@ -86,86 +82,6 @@ func (c *Client) handleSort() error {
 			}
 		}
 	}
-	return nil
-}
-
-func (c *Client) handleESort() error {
-	cmd := findPendingCmdByType[*SortCommand](c)
-	if cmd == nil {
-		// This is an unsolicited ESORT response, parse and discard its parameters
-		for c.dec.SP() {
-			if !c.dec.DiscardValue() {
-				return c.dec.Err()
-			}
-		}
-		return nil
-	}
-
-	isUID := cmd.numKind == imapwire.NumKindUID
-
-	for c.dec.SP() {
-		var s string
-		if c.dec.Special('(') {
-			var key, tag string
-			if !c.dec.ExpectAtom(&key) || !strings.EqualFold(key, "TAG") || !c.dec.ExpectSP() || !c.dec.ExpectAString(&tag) || !c.dec.ExpectSpecial(')') {
-				return c.dec.Err()
-			}
-			continue
-		}
-
-		if !c.dec.ExpectAtom(&s) {
-			return c.dec.Err()
-		}
-
-		switch strings.ToUpper(s) {
-		case "UID":
-			isUID = true
-		case "MIN":
-			if !c.dec.ExpectSP() || !c.dec.ExpectNumber(&cmd.data.Min) {
-				return c.dec.Err()
-			}
-		case "MAX":
-			if !c.dec.ExpectSP() || !c.dec.ExpectNumber(&cmd.data.Max) {
-				return c.dec.Err()
-			}
-		case "COUNT":
-			if !c.dec.ExpectSP() || !c.dec.ExpectNumber(&cmd.data.Count) {
-				return c.dec.Err()
-			}
-		case "ALL":
-			var seqSetStr string
-			if !c.dec.ExpectSP() || !c.dec.ExpectAtom(&seqSetStr) {
-				return c.dec.Err()
-			}
-			set, err := imapnum.ParseSet(seqSetStr)
-			if err != nil {
-				return fmt.Errorf("in ALL seq-set: %w", err)
-			}
-
-			const maxAllResultSize = 10_000_000
-			if set.Cardinality() > maxAllResultSize {
-				return fmt.Errorf("esort: server returned ALL set with %d entries (cap %d)",
-					set.Cardinality(), maxAllResultSize)
-			}
-
-			nums, ok := set.Nums()
-			if !ok {
-				return fmt.Errorf("esort: ALL contained a dynamic set, which is not allowed")
-			}
-
-			if isUID {
-				cmd.data.UIDs = make([]imap.UID, len(nums))
-				for i, n := range nums {
-					cmd.data.UIDs[i] = imap.UID(n)
-				}
-			} else {
-				cmd.data.SeqNums = nums
-			}
-		default:
-			return fmt.Errorf("unknown ESORT return option: %q", s)
-		}
-	}
-
 	return nil
 }
 

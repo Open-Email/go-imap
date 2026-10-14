@@ -318,3 +318,58 @@ func ParseSet(set string) (Set, error) {
 	}
 	return s, nil
 }
+
+// ParseOrderedNums parses a static sequence-set string and returns its numbers
+// in wire order (without sorting or merging ranges), as required by RFC 5267
+// §3 for the ALL item of an ESEARCH response to a SORT command.
+func ParseOrderedNums(set string, maxLen int) ([]uint32, error) {
+	if set == "" {
+		return nil, nil
+	}
+	parts := strings.Split(set, ",")
+	nums := make([]uint32, 0, len(parts))
+	for _, sv := range parts {
+		if sep := strings.IndexRune(sv, ':'); sep < 0 {
+			n, err := parseNum(sv)
+			if err != nil || n == 0 {
+				return nil, errBadNumSet(sv)
+			}
+			if len(nums)+1 > maxLen {
+				return nil, fmt.Errorf("imap: number set exceeds max length %d", maxLen)
+			}
+			nums = append(nums, n)
+		} else {
+			start, err1 := parseNum(sv[:sep])
+			stop, err2 := parseNum(sv[sep+1:])
+			if err1 != nil || err2 != nil || start == 0 || stop == 0 {
+				return nil, errBadNumSet(sv)
+			}
+			var count uint64
+			if start <= stop {
+				count = uint64(stop-start) + 1
+			} else {
+				count = uint64(start-stop) + 1
+			}
+			if uint64(len(nums))+count > uint64(maxLen) {
+				return nil, fmt.Errorf("imap: number set exceeds max length %d", maxLen)
+			}
+			if start <= stop {
+				for n := start; ; n++ {
+					nums = append(nums, n)
+					if n == stop {
+						break
+					}
+				}
+			} else {
+				for n := start; ; n-- {
+					nums = append(nums, n)
+					if n == stop {
+						break
+					}
+				}
+			}
+		}
+	}
+	return nums, nil
+}
+

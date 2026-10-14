@@ -193,6 +193,36 @@ func TestSort(t *testing.T) {
 		if !reflect.DeepEqual(data.SeqNums, wantSeqNums) {
 			t.Errorf("ESort() SeqNums = %v, want %v", data.SeqNums, wantSeqNums)
 		}
+
+		// Reverse sort order must be preserved in ALL (3, 2, 1), not sorted back
+		// into ascending numerical order.
+		revOptions := &imapclient.SortOptions{
+			SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyArrival, Reverse: true}},
+			SearchCriteria: allMsgs,
+			Return: imap.SortOptions{
+				ReturnCount: true,
+				ReturnMin:   true,
+				ReturnMax:   true,
+				ReturnAll:   true,
+			},
+		}
+		revData, err := client.Sort(revOptions).Wait()
+		if err != nil {
+			t.Fatalf("ESort(REVERSE) failed: %v", err)
+		}
+		wantRevSeq := []uint32{3, 2, 1}
+		if !reflect.DeepEqual(revData.SeqNums, wantRevSeq) {
+			t.Errorf("ESort(REVERSE) SeqNums = %v, want %v", revData.SeqNums, wantRevSeq)
+		}
+
+		revUIDData, err := client.UIDSort(revOptions).Wait()
+		if err != nil {
+			t.Fatalf("UIDSort(REVERSE RETURN) failed: %v", err)
+		}
+		wantRevUIDs := []imap.UID{3, 2, 1}
+		if !reflect.DeepEqual(revUIDData.UIDs, wantRevUIDs) {
+			t.Errorf("UIDSort(REVERSE RETURN) UIDs = %v, want %v", revUIDData.UIDs, wantRevUIDs)
+		}
 	})
 
 	t.Run("Empty result", func(t *testing.T) {

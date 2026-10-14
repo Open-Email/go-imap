@@ -135,8 +135,10 @@ func (c *Conn) handleSort(tag string, dec *imapwire.Decoder, numKind NumKind) er
 		return err
 	}
 
-	// Write SORT/ESORT response
-	if c.isIMAP4rev2() || extended {
+	// Write SORT/ESEARCH response (RFC 5256 §4 / RFC 5267 §3).
+	// RFC 9051 §6.4.4 deprecates only the SEARCH response; it does not touch
+	// SORT, so a plain SORT always returns * SORT even when IMAP4rev2 is enabled.
+	if extended {
 		return c.writeESort(tag, data, &options, numKind)
 	} else {
 		return c.writeSort(data.All, numKind)
@@ -163,7 +165,9 @@ func (c *Conn) writeESort(tag string, data *imap.SortData, options *imap.SortOpt
 	enc := newResponseEncoder(c)
 	defer enc.end()
 
-	enc.Atom("*").SP().Atom("ESORT")
+	// RFC 5267 §3: extended SORT returns its results in an ESEARCH response
+	// (ESORT is only the capability name in §5, not a response token).
+	enc.Atom("*").SP().Atom("ESEARCH")
 	if tag != "" {
 		enc.SP().Special('(').Atom("TAG").SP().String(tag).Special(')')
 	}

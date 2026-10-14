@@ -8,8 +8,11 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/internal"
+	"github.com/emersion/go-imap/v2/internal/imapnum"
 	"github.com/emersion/go-imap/v2/internal/imapwire"
 )
+
+const maxAllResultSize = 10_000_000
 
 func returnSearchOptions(options *imap.SearchOptions) []string {
 	if options == nil {
@@ -207,7 +210,7 @@ func (c *Client) handleESearch() error {
 	if !c.dec.ExpectSP() {
 		return c.dec.Err()
 	}
-	tag, data, err := readESearchResponse(c.dec)
+	tag, data, allRaw, isUID, err := readESearchResponse(c.dec)
 	if err != nil {
 		return err
 	}
@@ -223,6 +226,11 @@ func (c *Client) handleESearch() error {
 				return cmd.tag == tag
 			}
 			return true
+		case *SortCommand:
+			if tag != "" {
+				return cmd.tag == tag
+			}
+			return true
 		}
 		return false
 	})
@@ -232,6 +240,24 @@ func (c *Client) handleESearch() error {
 			cmd.data = *data
 		case *MultiSearchCommand:
 			cmd.data = append(cmd.data, data)
+		case *SortCommand:
+			cmd.data.Min = data.Min
+			cmd.data.Max = data.Max
+			cmd.data.Count = data.Count
+			if allRaw != "" {
+				nums, err := imapnum.ParseOrderedNums(allRaw, maxAllResultSize)
+				if err != nil {
+					return err
+				}
+				if isUID || cmd.numKind == imapwire.NumKindUID {
+					cmd.data.UIDs = make([]imap.UID, len(nums))
+					for i, n := range nums {
+						cmd.data.UIDs[i] = imap.UID(n)
+					}
+				} else {
+					cmd.data.SeqNums = nums
+				}
+			}
 		}
 	}
 	return nil
@@ -378,7 +404,7 @@ func flagSearchKey(flag imap.Flag) string {
 	}
 }
 
-func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchData, err error) {
+func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchData, allRaw string, isUID bool, err error) {
 	data = &imap.SearchData{}
 	if dec.Special('(') { // search-correlator
 		// RFC 7377 §2.1: the correlator carries TAG plus, for multi-mailbox
@@ -386,71 +412,71 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 		for {
 			var itemName string
 			if !dec.ExpectAtom(&itemName) || !dec.ExpectSP() {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			switch strings.ToUpper(itemName) {
 			case "TAG":
 				if !dec.ExpectAString(&tag) {
-					return "", nil, dec.Err()
+					return "", nil, "", false, dec.Err()
 				}
 			case "MAILBOX":
 				if !dec.ExpectMailbox(&data.Mailbox) {
-					return "", nil, dec.Err()
+					return "", nil, "", false, dec.Err()
 				}
 			case "UIDVALIDITY":
 				if !dec.ExpectNumber(&data.UIDValidity) {
-					return "", nil, dec.Err()
+					return "", nil, "", false, dec.Err()
 				}
 			default:
-				return "", nil, fmt.Errorf("in search-correlator: unknown item %q", itemName)
+				return "", nil, "", false, fmt.Errorf("in search-correlator: unknown item %q", itemName)
 			}
 			if !dec.SP() {
 				break
 			}
 		}
 		if !dec.ExpectSpecial(')') {
-			return "", nil, dec.Err()
+			return "", nil, "", false, dec.Err()
 		}
 	}
 
 	var name string
 	if !dec.SP() {
-		return tag, data, nil
+		return tag, data, "", false, nil
 	} else if !dec.ExpectAtom(&name) {
-		return "", nil, dec.Err()
+		return "", nil, "", false, dec.Err()
 	}
-	isUID := name == "UID"
+	isUID = name == "UID"
 
 	if isUID {
 		if !dec.SP() {
-			return tag, data, nil
+			return tag, data, "", true, nil
 		} else if !dec.ExpectAtom(&name) {
-			return "", nil, dec.Err()
+			return "", nil, "", false, dec.Err()
 		}
 	}
 
 	for {
 		if !dec.ExpectSP() {
-			return "", nil, dec.Err()
+			return "", nil, "", false, dec.Err()
 		}
 
 		switch strings.ToUpper(name) {
 		case "MAILBOX":
 			var mbox string
 			if !dec.ExpectMailbox(&mbox) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			data.Mailbox = mbox
 		case "MIN":
 			var num uint32
 			if !dec.ExpectNumber(&num) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			data.Min = num
 		case "MAX":
 			var num uint32
 			if !dec.ExpectNumber(&num) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			data.Max = num
 		case "ALL":
@@ -460,13 +486,12 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 			}
 			// The loop's own ExpectSP above already consumed the SP between
 			// "ALL" and the sequence-set; do not read a second one here.
-			if !dec.ExpectNumSet(numKind, &data.All) {
-				return "", nil, dec.Err()
+			if !dec.ExpectNumSetRaw(numKind, &data.All, &allRaw) {
+				return "", nil, "", false, dec.Err()
 			}
 			if data.All.Dynamic() {
-				return "", nil, fmt.Errorf("imapclient: server returned a dynamic ALL number set in SEARCH response")
+				return "", nil, "", false, fmt.Errorf("imapclient: server returned a dynamic ALL number set in SEARCH response")
 			}
-			const maxAllResultSize = 10_000_000
 			var cardinality uint64
 			switch set := data.All.(type) {
 			case imap.SeqSet:
@@ -475,12 +500,12 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 				cardinality = set.Cardinality()
 			}
 			if cardinality > maxAllResultSize {
-				return "", nil, fmt.Errorf("imapclient: server returned ALL set with %d entries (cap %d)", cardinality, maxAllResultSize)
+				return "", nil, "", false, fmt.Errorf("imapclient: server returned ALL set with %d entries (cap %d)", cardinality, maxAllResultSize)
 			}
 		case "COUNT":
 			var num uint32
 			if !dec.ExpectNumber(&num) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			data.Count = num
 		case "MODSEQ":
@@ -488,12 +513,12 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 			// in an ESEARCH response.
 			var modSeq uint64
 			if !dec.ExpectModSeq(&modSeq) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			data.ModSeq = modSeq
 		default:
 			if !dec.DiscardValue() {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 		}
 
@@ -505,32 +530,32 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 			// "MODSEQ n".  Accept both forms.
 			var atomName string
 			if !dec.ExpectAtom(&atomName) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 			if strings.ToUpper(atomName) == "MODSEQ" {
 				var modSeq uint64
 				if !dec.ExpectSP() || !dec.ExpectModSeq(&modSeq) || !dec.ExpectSpecial(')') {
-					return "", nil, dec.Err()
+					return "", nil, "", false, dec.Err()
 				}
 				data.ModSeq = modSeq
 			} else {
 				// Unknown parenthesized item, skip it
 				if !dec.DiscardValue() || !dec.ExpectSpecial(')') {
-					return "", nil, dec.Err()
+					return "", nil, "", false, dec.Err()
 				}
 			}
 			// Continue to check for more items
 			if !dec.SP() {
 				break
 			} else if !dec.ExpectAtom(&name) {
-				return "", nil, dec.Err()
+				return "", nil, "", false, dec.Err()
 			}
 		} else if !dec.ExpectAtom(&name) {
-			return "", nil, dec.Err()
+			return "", nil, "", false, dec.Err()
 		}
 	}
 
-	return tag, data, nil
+	return tag, data, allRaw, isUID, nil
 }
 
 func searchCriteriaIsASCII(criteria *imap.SearchCriteria) bool {

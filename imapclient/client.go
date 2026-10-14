@@ -1204,8 +1204,6 @@ func (c *Client) readResponseData(typ string) error {
 		return c.handleESearch()
 	case "SORT":
 		return c.handleSort()
-	case "ESORT":
-		return c.handleESort()
 	case "THREAD":
 		return c.handleThread()
 	case "METADATA":

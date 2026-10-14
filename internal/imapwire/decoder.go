@@ -764,14 +764,24 @@ func (dec *Decoder) ExpectUID(ptr *imap.UID) bool {
 }
 
 func (dec *Decoder) ExpectNumSet(kind NumKind, ptr *imap.NumSet) bool {
+	return dec.ExpectNumSetRaw(kind, ptr, nil)
+}
+
+func (dec *Decoder) ExpectNumSetRaw(kind NumKind, ptr *imap.NumSet, raw *string) bool {
 	if dec.Special('$') {
 		*ptr = imap.SearchRes()
+		if raw != nil {
+			*raw = "$"
+		}
 		return true
 	}
 
 	var s string
 	if !dec.Expect(dec.Func(&s, isNumSetChar), "sequence-set") {
 		return false
+	}
+	if raw != nil {
+		*raw = s
 	}
 	numSet, err := imapnum.ParseSet(s)
 	if err != nil {
