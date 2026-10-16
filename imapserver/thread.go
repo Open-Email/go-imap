@@ -91,8 +91,13 @@ func (c *Conn) writeThread(data []imap.ThreadData) error {
 
 	enc.Atom("*").SP().Atom("THREAD")
 
-	for _, t := range data {
+	// thread-data = "THREAD" [SP 1*thread-list] (RFC 5256 section 4): one SP,
+	// then the thread-lists back to back. Roundcube reads a THREAD response by
+	// matching parentheses and drops every thread after a separating SP.
+	if len(data) > 0 {
 		enc.SP()
+	}
+	for _, t := range data {
 		writeThreadData(enc.Encoder, t)
 	}
 
