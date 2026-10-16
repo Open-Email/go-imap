@@ -43,7 +43,7 @@ func TestThread(t *testing.T) {
 }
 
 // TestThreadResponseParsing checks that the client reads THREAD responses in
-// the RFC 5256 section 4 form, where thread-lists follow one another with
+// the RFC 5256 section 5 form, where thread-lists follow one another with
 // nothing between them, and in the SP-separated form go-imap servers sent
 // before. Both parse because Decoder.SP accepts a missing SP before '('; that
 // leniency is also why a client test against the server never caught the
