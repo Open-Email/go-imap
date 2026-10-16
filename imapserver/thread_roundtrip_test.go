@@ -15,8 +15,8 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 )
 
-// rfc5256Example is the REFERENCES example of RFC 5256 section 4, followed by
-// a thread whose root is missing, as in the section's ORDEREDSUBJECT example.
+// rfc5256Example is the first example of RFC 5256 section 4, followed by its
+// second, a thread whose parent does not match the search.
 var rfc5256Example = []imap.ThreadData{
 	{Chain: []uint32{2}},
 	{Chain: []uint32{3, 6}, SubThreads: []imap.ThreadData{
@@ -74,7 +74,7 @@ func (c *recordingConn) line(prefix string) string {
 // client's parser and checks that it comes back unchanged.
 //
 // The client's parser takes a missing SP before '(' in its stride, so on its
-// own it cannot tell the RFC 5256 section 4 form from one with an SP between
+// own it cannot tell the RFC 5256 section 5 form from one with an SP between
 // the thread-lists. Roundcube can, and drops every thread after such an SP.
 // The test therefore also reads the THREAD line off the wire and checks it is
 // in the RFC's form.

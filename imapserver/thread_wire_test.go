@@ -7,7 +7,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 )
 
-// TestWriteThreadWireFormat pins the THREAD response to the RFC 5256 section 4
+// TestWriteThreadWireFormat pins the THREAD response to the RFC 5256 section 5
 // grammar:
 //
 //	thread-data    = "THREAD" [SP 1*thread-list]

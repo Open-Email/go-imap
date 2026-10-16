@@ -8,7 +8,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 )
 
-// TestWriteThreadNormalizesLists checks that a tree the RFC 5256 section 4
+// TestWriteThreadNormalizesLists checks that a tree the RFC 5256 section 5
 // grammar cannot express directly is written in a form it can. thread-nested
 // is 2*thread-list and thread-members starts with an nz-number, so a node
 // with a single sub-thread is written as one chain, (1 (2)) as (1 2), and a
