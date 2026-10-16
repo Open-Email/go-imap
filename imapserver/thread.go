@@ -91,12 +91,47 @@ func (c *Conn) writeThread(data []imap.ThreadData) error {
 
 	enc.Atom("*").SP().Atom("THREAD")
 
+	var lists []imap.ThreadData
 	for _, t := range data {
+		if t, ok := normalizeThread(t); ok {
+			lists = append(lists, t)
+		}
+	}
+
+	// thread-data = "THREAD" [SP 1*thread-list] (RFC 5256 section 4): one SP,
+	// then the thread-lists back to back. Roundcube reads a THREAD response by
+	// matching parentheses and drops every thread after a separating SP.
+	if len(lists) > 0 {
 		enc.SP()
+	}
+	for _, t := range lists {
 		writeThreadData(enc.Encoder, t)
 	}
 
 	return enc.CRLF()
+}
+
+// normalizeThread puts data in a form the RFC 5256 section 4 grammar can
+// express. A thread-list holds either messages or at least two nested
+// thread-lists, so a node with a single sub-thread is written as that
+// sub-thread continuing the chain, (1 (2)) as (1 2), and a node with neither
+// messages nor sub-threads is left out. ok is false when nothing remains.
+func normalizeThread(data imap.ThreadData) (_ imap.ThreadData, ok bool) {
+	chain := append([]uint32(nil), data.Chain...)
+	var subs []imap.ThreadData
+	for _, sub := range data.SubThreads {
+		if sub, ok := normalizeThread(sub); ok {
+			subs = append(subs, sub)
+		}
+	}
+	for len(subs) == 1 {
+		chain = append(chain, subs[0].Chain...)
+		subs = subs[0].SubThreads
+	}
+	if len(chain) == 0 && len(subs) == 0 {
+		return imap.ThreadData{}, false
+	}
+	return imap.ThreadData{Chain: chain, SubThreads: subs}, true
 }
 
 func writeThreadData(enc *imapwire.Encoder, data imap.ThreadData) {
