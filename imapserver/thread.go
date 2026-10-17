@@ -98,7 +98,7 @@ func (c *Conn) writeThread(data []imap.ThreadData) error {
 		}
 	}
 
-	// thread-data = "THREAD" [SP 1*thread-list] (RFC 5256 section 4): one SP,
+	// thread-data = "THREAD" [SP 1*thread-list] (RFC 5256 section 5): one SP,
 	// then the thread-lists back to back. Roundcube reads a THREAD response by
 	// matching parentheses and drops every thread after a separating SP.
 	if len(lists) > 0 {
@@ -111,7 +111,7 @@ func (c *Conn) writeThread(data []imap.ThreadData) error {
 	return enc.CRLF()
 }
 
-// normalizeThread puts data in a form the RFC 5256 section 4 grammar can
+// normalizeThread puts data in a form the RFC 5256 section 5 grammar can
 // express. A thread-list holds either messages or at least two nested
 // thread-lists, so a node with a single sub-thread is written as that
 // sub-thread continuing the chain, (1 (2)) as (1 2), and a node with neither
