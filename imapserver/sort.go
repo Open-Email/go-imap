@@ -124,10 +124,22 @@ func (c *Conn) handleSort(tag string, dec *imapwire.Decoder, numKind NumKind) er
 		return err
 	}
 
+	// RETURN after SORT is ESORT's syntax (RFC 5267 §3); RFC 5256 has none, so
+	// without ESORT even an empty RETURN () is an argument the server does not
+	// support, which gets BAD as for SEARCH (RFC 4466 §2.6.1). The session cannot
+	// do this itself, since a plain SORT reaches it as RETURN (ALL) (below).
+	if extended && !c.supportsESort() {
+		return newClientBugError("SORT RETURN requires ESORT")
+	}
+
 	// If no return option is specified, ALL is assumed
 	if !options.ReturnMin && !options.ReturnMax && !options.ReturnAll && !options.ReturnCount {
 		options.ReturnAll = true
 	}
+
+	// Read before the session can rewrite the criteria. readSearchKey keeps a
+	// MODSEQ key only when CONDSTORE is supported.
+	hasModSeq := searchCriteriaHasModSeq(&searchCriteria)
 
 	// Call the session's Sort method
 	data, err := c.session.Sort(c.ctx, numKind, sortCriteria, charset, &searchCriteria, &options)
@@ -135,17 +147,43 @@ func (c *Conn) handleSort(tag string, dec *imapwire.Decoder, numKind NumKind) er
 		return err
 	}
 
-	// Write SORT/ESEARCH response (RFC 5256 §4 / RFC 5267 §3).
-	// RFC 9051 §6.4.4 deprecates only the SEARCH response; it does not touch
-	// SORT, so a plain SORT always returns * SORT even when IMAP4rev2 is enabled.
+	// RFC 7162 §3.1.9 and §3.1.10: the response carries the highest
+	// mod-sequence of the result only when the criteria use MODSEQ. A client
+	// that did not ask cannot be expected to parse it.
+	if !hasModSeq {
+		data.ModSeq = 0
+	}
+
+	// Write SORT/ESEARCH response. Only return options select ESEARCH (RFC 5267
+	// §3.1). IMAP4rev2 changes SEARCH's answer (RFC 9051 §6.4.4) but not
+	// SORT's, which stays the SORT response of RFC 5256 §4.
 	if extended {
 		return c.writeESort(tag, data, &options, numKind)
 	} else {
-		return c.writeSort(data.All, numKind)
+		return c.writeSort(data.All, data.ModSeq, numKind)
 	}
 }
 
-func (c *Conn) writeSort(nums []uint32, numKind NumKind) error {
+// searchCriteriaHasModSeq reports whether criteria use a MODSEQ key anywhere,
+// including under NOT and OR.
+func searchCriteriaHasModSeq(criteria *imap.SearchCriteria) bool {
+	if criteria.ModSeq != nil {
+		return true
+	}
+	for i := range criteria.Not {
+		if searchCriteriaHasModSeq(&criteria.Not[i]) {
+			return true
+		}
+	}
+	for i := range criteria.Or {
+		if searchCriteriaHasModSeq(&criteria.Or[i][0]) || searchCriteriaHasModSeq(&criteria.Or[i][1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Conn) writeSort(nums []uint32, modSeq uint64, numKind NumKind) error {
 	enc := newResponseEncoder(c)
 	defer enc.end()
 
@@ -158,15 +196,21 @@ func (c *Conn) writeSort(nums []uint32, numKind NumKind) error {
 			enc.Number(num)
 		}
 	}
+	// RFC 7162 §3.1.9, e.g. "* SORT 2 3 4 (MODSEQ 917162500)". The grammar
+	// allows it only after at least one number.
+	if modSeq > 0 && len(nums) > 0 {
+		enc.SP().Special('(').Atom("MODSEQ").SP().ModSeq(modSeq).Special(')')
+	}
 	return enc.CRLF()
 }
 
+// writeESort answers an extended SORT. RFC 5267 §3.1 gives SORT the return
+// options of ESEARCH and answers it with an ESEARCH response, with ALL in sort
+// order; no RFC defines an ESORT response.
 func (c *Conn) writeESort(tag string, data *imap.SortData, options *imap.SortOptions, numKind NumKind) error {
 	enc := newResponseEncoder(c)
 	defer enc.end()
 
-	// RFC 5267 §3: extended SORT returns its results in an ESEARCH response
-	// (ESORT is only the capability name in §5, not a response token).
 	enc.Atom("*").SP().Atom("ESEARCH")
 	if tag != "" {
 		enc.SP().Special('(').Atom("TAG").SP().String(tag).Special(')')
@@ -197,6 +241,10 @@ func (c *Conn) writeESort(tag string, data *imap.SortData, options *imap.SortOpt
 	if options.ReturnCount {
 		enc.SP().Atom("COUNT").SP().Number(data.Count)
 	}
+	// RFC 7162 §3.1.10, e.g. "* ESEARCH (TAG "a") ALL 5,3,2,1 MODSEQ 1236".
+	if data.ModSeq > 0 {
+		enc.SP().Atom("MODSEQ").SP().ModSeq(data.ModSeq)
+	}
 	return enc.CRLF()
 }
 
@@ -224,14 +272,15 @@ func readSortReturnOpts(dec *imapwire.Decoder, options *imap.SortOptions) error 
 			options.ReturnCount = true
 			numRecognizedOpts++
 		default:
-			// RFC 5267: Servers MUST ignore any unknown sort-return-opt
+			// Extended SORT uses the result-option rules of RFC 4466 §2.6.1
+			// (RFC 5267 §3), including rejection of unsupported options.
+			return newClientBugError(fmt.Sprintf("Unknown SORT return option: %q", name))
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	// RFC 5267: If the list of return options is present but empty (or only has unknown options),
-	// then the server provides the ALL return data item
+	// RFC 5267 §3.3: an empty list requests the ALL return data item.
 	if numRecognizedOpts == 0 {
 		options.ReturnAll = true
 	}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -450,6 +451,10 @@ func (mbox *MailboxView) Search(ctx context.Context, numKind imapserver.NumKind,
 		data   imap.SearchData
 		seqSet imap.SeqSet
 		uidSet imap.UIDSet
+		// Mod-sequences of all matches, and of the MIN and MAX messages.
+		allModSeq, minModSeq, maxModSeq uint64
+		// SAVE stores UIDs even when MIN and MAX are sequence numbers.
+		minUID, maxUID imap.UID
 	)
 	for i, msg := range mbox.l {
 		seqNum := mbox.tracker.EncodeSeqNum(uint32(i) + 1)
@@ -473,11 +478,12 @@ func (mbox *MailboxView) Search(ctx context.Context, numKind imapserver.NumKind,
 			num = uint32(msg.uid)
 		}
 		if data.Min == 0 || num < data.Min {
-			data.Min = num
+			data.Min, minModSeq, minUID = num, msg.modSeq, msg.uid
 		}
 		if data.Max == 0 || num > data.Max {
-			data.Max = num
+			data.Max, maxModSeq, maxUID = num, msg.modSeq, msg.uid
 		}
+		allModSeq = max(allModSeq, msg.modSeq)
 		data.Count++
 	}
 
@@ -488,12 +494,46 @@ func (mbox *MailboxView) Search(ctx context.Context, numKind imapserver.NumKind,
 		data.All = uidSet
 	}
 
-	data.ModSeq = mbox.highestModSeq
+	// RFC 7162 §3.1.5: the highest mod-sequence of the messages returned, not
+	// of the mailbox. RFC 4731 §3.2 narrows it for MIN and MAX without ALL or
+	// COUNT.
+	if options.ReturnAll || options.ReturnCount || !(options.ReturnMin || options.ReturnMax) {
+		data.ModSeq = allModSeq
+	} else {
+		if options.ReturnMin {
+			data.ModSeq = minModSeq
+		}
+		if options.ReturnMax {
+			data.ModSeq = max(data.ModSeq, maxModSeq)
+		}
+	}
 	if options.ReturnSave {
-		mbox.searchRes = uidSet
+		// RFC 5182 §2.4 / RFC 9051 §6.4.4.1: MIN/MAX without ALL or
+		// COUNT saves only those endpoint messages; otherwise save all
+		// matches. Keep actual UIDs so "$" works in either number space.
+		if options.ReturnAll || options.ReturnCount || !(options.ReturnMin || options.ReturnMax) {
+			mbox.searchRes = uidSet
+		} else {
+			var saved imap.UIDSet
+			if options.ReturnMin && minUID != 0 {
+				saved.AddNum(minUID)
+			}
+			if options.ReturnMax && maxUID != 0 {
+				saved.AddNum(maxUID)
+			}
+			mbox.searchRes = saved
+		}
 	}
 
 	return &data, nil
+}
+
+// ResetSearchRes empties the SEARCHRES variable "$".
+func (mbox *MailboxView) ResetSearchRes() {
+	mbox.mutex.Lock()
+	defer mbox.mutex.Unlock()
+
+	mbox.searchRes = nil
 }
 
 func (mbox *MailboxView) Sort(ctx context.Context, kind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
@@ -529,33 +569,43 @@ func (mbox *MailboxView) Sort(ctx context.Context, kind imapserver.NumKind, sort
 		}
 	}
 
-	var data imap.SortData
+	var (
+		data    imap.SortData
+		modSeqs []uint64 // of the messages in data.All, in the same order
+	)
 	for _, msg := range sorter.msgs {
 		if kind == imapserver.NumKindUID {
 			data.All = append(data.All, uint32(msg.uid))
 		} else {
-			if seqNum, ok := uidToSeq[msg.uid]; ok && seqNum > 0 {
-				data.All = append(data.All, seqNum)
+			seqNum, ok := uidToSeq[msg.uid]
+			if !ok || seqNum == 0 {
+				continue
 			}
+			data.All = append(data.All, seqNum)
 		}
+		modSeqs = append(modSeqs, msg.modSeq)
 	}
 
 	// 4. Calculate MIN, MAX, COUNT for ESORT
 	data.Count = uint32(len(data.All))
-	if len(data.All) > 0 {
-		// Find the true min and max, regardless of sort order, as required
-		// by RFC 5267.
-		min, max := data.All[0], data.All[0]
-		for _, num := range data.All[1:] {
-			if num < min {
-				min = num
+	if n := len(data.All); n > 0 {
+		// RFC 5267 §3.1: MIN and MAX are the lowest and highest *sorted*
+		// messages, the first and last in sort order.
+		data.Min, data.Max = data.All[0], data.All[n-1]
+
+		// RFC 4731 §3.2 (RFC 7162 §3.1.10 for SORT): MODSEQ covers only the
+		// messages the response returns. No return option means ALL, as in
+		// Search.
+		if options == nil || options.ReturnAll || options.ReturnCount || !(options.ReturnMin || options.ReturnMax) {
+			data.ModSeq = slices.Max(modSeqs)
+		} else {
+			if options.ReturnMin {
+				data.ModSeq = modSeqs[0]
 			}
-			if num > max {
-				max = num
+			if options.ReturnMax {
+				data.ModSeq = max(data.ModSeq, modSeqs[n-1])
 			}
 		}
-		data.Min = min
-		data.Max = max
 	}
 
 	return &data, nil
@@ -712,7 +762,7 @@ func writeStoreFetchResponse(w *imapserver.FetchWriter, mod modifiedMessageData,
 }
 
 func (mbox *MailboxView) Store(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
-	// RFC 7162 §3.1.3.1: an absent UNCHANGEDSINCE modifier means an
+	// RFC 7162 §3.1.3: an absent UNCHANGEDSINCE modifier means an
 	// unconditional store, while an explicit "UNCHANGEDSINCE 0" is the
 	// always-fail probe, which must fail for every message that carries a
 	// modification sequence. Conditional folds presence and value into the one

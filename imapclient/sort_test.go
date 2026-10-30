@@ -230,6 +230,23 @@ func TestSort(t *testing.T) {
 		}
 	})
 
+	t.Run("ESORT REVERSE", func(t *testing.T) {
+		options := &imapclient.SortOptions{
+			SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyArrival, Reverse: true}},
+			SearchCriteria: allMsgs,
+			Return:         imap.SortOptions{ReturnAll: true},
+		}
+		data, err := client.Sort(options).Wait()
+		if err != nil {
+			t.Fatalf("Sort() failed: %v", err)
+		}
+		// RFC 5267 §3.1: ALL lists the messages in sort order.
+		wantSeqNums := []uint32{3, 2, 1}
+		if !reflect.DeepEqual(data.SeqNums, wantSeqNums) {
+			t.Errorf("Sort() SeqNums = %v, want %v", data.SeqNums, wantSeqNums)
+		}
+	})
+
 	t.Run("Empty result", func(t *testing.T) {
 		// Search for a non-existent message
 		options := &imapclient.SortOptions{
@@ -263,8 +280,10 @@ func TestSort(t *testing.T) {
 }
 
 // TestESortWire verifies RFC 5267 §3.2 ordered ALL range expansion (12:10 is
-// equivalent to 10:12, while comma-separated tokens preserve wire order) and
-// uncorrelated ESEARCH responses on SortCommand.
+// equivalent to 10:12, while comma-separated tokens preserve wire order), and
+// that an uncorrelated ESEARCH, which no command caused (RFC 4466 §2.6.2), is
+// read without desynchronising the stream and without landing in a SORT's
+// result.
 func TestESortWire(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -285,15 +304,19 @@ func TestESortWire(t *testing.T) {
 			wantUIDs: []imap.UID{30, 10, 11, 12, 5},
 		},
 		{
+			name: "correlated seqnum with descending range token",
+			uid:  false,
+			wireLine: func(tag string) string {
+				return fmt.Sprintf("* ESEARCH (TAG %q) ALL 12:10\r\n", tag)
+			},
+			wantSeqs: []uint32{10, 11, 12},
+		},
+		{
 			name: "uncorrelated UID with MIN MAX COUNT ALL",
 			uid:  true,
 			wireLine: func(tag string) string {
 				return "* ESEARCH UID MIN 30 MAX 5 COUNT 5 ALL 30,12:10,5\r\n"
 			},
-			wantUIDs: []imap.UID{30, 10, 11, 12, 5},
-			wantMin:  30,
-			wantMax:  5,
-			wantCnt:  5,
 		},
 		{
 			name: "uncorrelated seqnum with descending range token",
@@ -301,7 +324,6 @@ func TestESortWire(t *testing.T) {
 			wireLine: func(tag string) string {
 				return "* ESEARCH ALL 12:10\r\n"
 			},
-			wantSeqs: []uint32{10, 11, 12},
 		},
 		{
 			name: "uncorrelated UID empty",
@@ -390,4 +412,3 @@ func TestESortWire(t *testing.T) {
 		})
 	}
 }
-

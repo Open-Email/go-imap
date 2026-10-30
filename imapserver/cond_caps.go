@@ -5,23 +5,24 @@ import (
 )
 
 // supportsCondStore returns true if the connection supports CONDSTORE extension.
-// This checks both session-specific capabilities (if available) and server capabilities,
-// as well as enabled capabilities.
+// This checks session-specific capabilities (if available), or else server
+// capabilities. QRESYNC implies CONDSTORE; IMAP4rev2 does not (RFC 9051
+// Appendix F), so a server that offers CONDSTORE lists it, and what this
+// accepts is what CAPABILITY advertises.
 //
 // Note: the previous iOS Mail workaround that disabled CONDSTORE for iOS clients
 // has been removed.  That workaround caused a capability lie (CONDSTORE was
 // advertised but then silently disabled) and the underlying server-side protocol
 // bugs that originally caused iOS compatibility issues have since been fixed:
 //   - MODSEQ in FETCH responses now correctly uses the "MODSEQ (value)" form
-//     (RFC 7162 §2.3.2).
-//   - ESEARCH MODSEQ result now uses the bare "MODSEQ value" form (RFC 7162
-//     §3.4).
+//     (RFC 7162 §3.1.4).
+//   - ESEARCH MODSEQ result now uses the bare "MODSEQ value" form (RFC 4731
+//     §3.2, RFC 7162 §3.1.10).
 //   - UID FETCH CHANGEDSINCE+VANISHED now uses the canonical parenthesised
-//     form (RFC 4466 §2.2 / RFC 7162 §6).
+//     form (RFC 4466 §2.4 / RFC 7162 §3.2.6).
 func (c *Conn) supportsCondStore() bool {
 	if capSession, ok := c.session.(SessionCapabilities); ok {
-		sessionCaps := capSession.GetCapabilities()
-		return sessionCaps.Has(imap.CapCondStore) || sessionCaps.Has(imap.CapIMAP4rev2)
+		return capSession.GetCapabilities().Has(imap.CapCondStore)
 	}
 	// Read the server's configured capabilities directly rather than
 	// availableCapsSet(), which is connection-state dependent and reads
@@ -29,11 +30,10 @@ func (c *Conn) supportsCondStore() bool {
 	// from the NOTIFY pump goroutine (via WriteMessageFlags and
 	// UpdateWriter.CondStoreEnabled) concurrently with command-goroutine state
 	// transitions; the configured CapSet is immutable after construction and
-	// CONDSTORE/IMAP4rev2 are backend-support capabilities that do not vary by
-	// state, so this is both race-free and equivalent in the authenticated/
-	// selected states where the pump runs. c.enabledHas already locks c.mutex.
-	serverCaps := c.server.options.caps()
-	return c.enabledHas(imap.CapIMAP4rev2) || serverCaps.Has(imap.CapCondStore) || serverCaps.Has(imap.CapIMAP4rev2)
+	// CONDSTORE is a backend-support capability that does not vary by state,
+	// so this is both race-free and equivalent in the authenticated/selected
+	// states where the pump runs.
+	return c.server.options.caps().Has(imap.CapCondStore)
 }
 
 // markCondStoreEnabled records that the client has issued a CONDSTORE-enabling
@@ -61,6 +61,31 @@ func (c *Conn) CondStoreEnabled() bool {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	return c.condStore || c.enabled.Has(imap.CapCondStore) || c.enabled.Has(imap.CapQResync)
+}
+
+// supportsESearch reports whether the session supports ESEARCH (RFC 4731),
+// which IMAP4rev2 includes.
+func (c *Conn) supportsESearch() bool {
+	if capSession, ok := c.session.(SessionCapabilities); ok {
+		sessionCaps := capSession.GetCapabilities()
+		return sessionCaps.Has(imap.CapESearch) || sessionCaps.Has(imap.CapIMAP4rev2)
+	}
+	return c.availableCapsSet().Has(imap.CapESearch) || c.availableCapsSet().Has(imap.CapIMAP4rev2)
+}
+
+// supportsSearchRes reports whether SAVE is supported (RFC 5182). Has includes
+// SEARCHRES when the session supports IMAP4rev2 (RFC 9051 Appendix E).
+func (c *Conn) supportsSearchRes() bool {
+	return c.configuredCaps().Has(imap.CapSearchRes)
+}
+
+// supportsESort reports whether the session supports ESORT (RFC 5267), which
+// IMAP4rev2 does not include.
+func (c *Conn) supportsESort() bool {
+	if capSession, ok := c.session.(SessionCapabilities); ok {
+		return capSession.GetCapabilities().Has(imap.CapESort)
+	}
+	return c.availableCapsSet().Has(imap.CapESort)
 }
 
 // supportsQResync returns true if the connection supports QRESYNC extension.

@@ -22,6 +22,8 @@ type SessionMultiSearch interface {
 	// enumerate the user's mailboxes) and MUST populate SearchData.Mailbox and
 	// SearchData.UIDValidity on every result (RFC 7377 §2.1). Because message
 	// numbers are meaningless for unselected mailboxes, results are always UIDs.
+	// With ReturnSave, source is selected-only and the backend must update the
+	// selected session's SEARCHRES variable, as for Session.Search.
 	MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error)
 }
 
@@ -32,7 +34,7 @@ type SessionMultiSearch interface {
 //
 // ESEARCH always operates in UID space and every response carries the
 // MAILBOX/TAG/UIDVALIDITY correlator. With no IN clause, "selected" is assumed.
-func (c *Conn) handleESearch(tag string, dec *imapwire.Decoder) error {
+func (c *Conn) handleESearch(tag string, dec *imapwire.Decoder) (err error) {
 	if !dec.ExpectSP() {
 		return dec.Err()
 	}
@@ -42,6 +44,15 @@ func (c *Conn) handleESearch(tag string, dec *imapwire.Decoder) error {
 		options imap.SearchOptions
 		source  imap.SearchSource
 	)
+	backendCalled := false
+	defer func() {
+		if !backendCalled {
+			err = c.failSearchBeforeBackend(err, &options, func() error {
+				_, badErr := c.checkESearch(&source, &options)
+				return badErr
+			})
+		}
+	}()
 
 	// Optional "IN (source-mbox)".
 	if maybeReadSearchKeyAtom(dec, &atom) && strings.EqualFold(atom, "IN") {
@@ -71,21 +82,13 @@ func (c *Conn) handleESearch(tag string, dec *imapwire.Decoder) error {
 	}
 
 	// Optional CHARSET.
+	var badCharset bool
 	if strings.EqualFold(atom, "CHARSET") {
 		var charset string
 		if !dec.ExpectSP() || !dec.ExpectAString(&charset) || !dec.ExpectSP() {
 			return dec.Err()
 		}
-		switch strings.ToUpper(charset) {
-		case "US-ASCII", "UTF-8":
-			// nothing to do
-		default:
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeBadCharset,
-				Text: "Only US-ASCII and UTF-8 are supported SEARCH charsets",
-			}
-		}
+		badCharset = !searchCharsetSupported(charset)
 		atom = ""
 		maybeReadSearchKeyAtom(dec, &atom)
 	}
@@ -127,26 +130,38 @@ func (c *Conn) handleESearch(tag string, dec *imapwire.Decoder) error {
 	if err := c.checkState(requiredState); err != nil {
 		return err
 	}
+	sessionMultiSearch, err := c.checkESearch(&source, &options)
+	if err != nil {
+		return err
+	}
+	saveOnly := options.ReturnSave && !options.ReturnMin && !options.ReturnMax && !options.ReturnAll && !options.ReturnCount
 
 	// If no return option is specified, ALL is assumed.
 	if !options.ReturnMin && !options.ReturnMax && !options.ReturnAll && !options.ReturnCount {
 		options.ReturnAll = true
 	}
 
-	sessionMultiSearch, ok := c.session.(SessionMultiSearch)
-	if !ok {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeBad,
-			Text: "MULTISEARCH not supported",
-		}
+	if badCharset {
+		return badSearchCharsetError()
 	}
 
+	// Read before the session can rewrite the criteria; see handleSearch.
+	hasModSeq := searchCriteriaHasModSeq(&criteria)
+
+	backendCalled = true
 	results, err := sessionMultiSearch.MultiSearch(c.ctx, &source, &criteria, &options)
 	if err != nil {
 		return err
 	}
+	if saveOnly {
+		// SAVE still runs the backend, but emits no search result response.
+		return nil
+	}
 
 	for _, data := range results {
+		if !hasModSeq {
+			data.ModSeq = 0
+		}
 		// RFC 7377 §2.1: "An ESEARCH response MUST NOT be returned for mailboxes
 		// that contain no matching messages. This is true even when result
 		// options such as MIN, MAX, and COUNT are specified."
@@ -159,6 +174,32 @@ func (c *Conn) handleESearch(tag string, dec *imapwire.Decoder) error {
 	}
 
 	return nil
+}
+
+// checkESearch rejects with BAD an ESEARCH that this connection cannot run
+// for a reason other than its state: SAVE needs SEARCHRES and "selected" as
+// the sole source, and the session must implement SessionMultiSearch. A zero
+// source is the default "selected" (RFC 7377 §2.1), so the check also holds
+// while the command is still being read.
+func (c *Conn) checkESearch(source *imap.SearchSource, options *imap.SearchOptions) (SessionMultiSearch, error) {
+	if options.ReturnSave {
+		if !c.supportsSearchRes() {
+			return nil, newClientBugError("SEARCH SAVE requires SEARCHRES")
+		}
+		// RFC 7377 §2.2 permits SAVE only when selected is the sole source,
+		// even if a different source happens to resolve to the same mailbox.
+		if !source.IsZero() && !source.SelectedOnly() {
+			return nil, newClientBugError("ESEARCH SAVE requires the selected source")
+		}
+	}
+	sessionMultiSearch, ok := c.session.(SessionMultiSearch)
+	if !ok {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "MULTISEARCH not supported",
+		}
+	}
+	return sessionMultiSearch, nil
 }
 
 // multiSearchDataIsEmpty reports whether a per-mailbox multi-search result

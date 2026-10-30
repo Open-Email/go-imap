@@ -102,6 +102,30 @@ func (c *Client) List(ref, pattern string, options *imap.ListOptions) *ListComma
 	return cmd
 }
 
+// Lsub sends an LSUB command (RFC 3501 section 6.3.9), which lists the
+// subscribed mailboxes.
+//
+// IMAP4rev2 removes LSUB in favor of LIST (SUBSCRIBED), which needs IMAP4rev2
+// or LIST-EXTENDED. LSUB is how an IMAP4rev1 server without LIST-EXTENDED
+// tells which mailboxes are subscribed. Its answer is LIST data, with one
+// difference: a mailbox that is not subscribed may be listed with
+// \Noselect, when the pattern ends in "%" and the mailbox has subscribed
+// children.
+//
+// The caller must fully consume the ListCommand, as for List.
+func (c *Client) Lsub(ref, pattern string) *ListCommand {
+	cmd := &ListCommand{
+		mailboxes: make(chan *imap.ListData, 64),
+		ref:       ref,
+		pattern:   pattern,
+		lsub:      true,
+	}
+	enc := c.beginCommand("LSUB", cmd)
+	enc.SP().Mailbox(ref).SP().Mailbox(pattern)
+	enc.end()
+	return cmd
+}
+
 func (c *Client) handleList() error {
 	data, err := readList(c.dec)
 	if err != nil {
@@ -111,7 +135,10 @@ func (c *Client) handleList() error {
 	cmd := c.findPendingCmdFunc(func(cmd command) bool {
 		switch cmd := cmd.(type) {
 		case *ListCommand:
-			return cmd.matches(data)
+			// A LIST response is never an answer to LSUB: one that arrives
+			// while LSUB is in flight is unsolicited (NOTIFY) and says
+			// nothing about subscriptions.
+			return !cmd.lsub && cmd.matches(data)
 		case *SelectCommand:
 			return cmd.mailbox == data.Mailbox && cmd.data.List == nil
 		default:
@@ -141,13 +168,43 @@ func (c *Client) handleList() error {
 	return nil
 }
 
-// ListCommand is a LIST command.
+// handleLsub reads an LSUB response, which has the grammar of a LIST
+// response, and hands it to the LSUB command it answers. There is no
+// unsolicited LSUB response: one that answers no LSUB command in flight is
+// dropped.
+func (c *Client) handleLsub() error {
+	data, err := readList(c.dec)
+	if err != nil {
+		return fmt.Errorf("in LSUB: %w", err)
+	}
+
+	isLsub := func(cmd command) bool {
+		list, ok := cmd.(*ListCommand)
+		return ok && list.lsub
+	}
+	// The pattern only picks between LSUB commands in flight. A response that
+	// matches none still answers one of them, since none is unsolicited, and
+	// the server's reading of the reference may be one matches cannot follow.
+	cmd := c.findPendingCmdFunc(func(cmd command) bool {
+		return isLsub(cmd) && cmd.(*ListCommand).matches(data)
+	})
+	if cmd == nil {
+		cmd = c.findPendingCmdFunc(isLsub)
+	}
+	if cmd != nil {
+		cmd.(*ListCommand).mailboxes <- data
+	}
+	return nil
+}
+
+// ListCommand is a LIST or an LSUB command.
 type ListCommand struct {
 	commandBase
 	mailboxes chan *imap.ListData
 
 	ref            string
 	pattern        string
+	lsub           bool // an LSUB command, answered with LSUB responses
 	returnStatus   bool
 	returnMetadata bool
 	pendingData    *imap.ListData
@@ -176,7 +233,48 @@ func (cmd *ListCommand) matches(data *imap.ListData) bool {
 	// The wire form is what the server matched against: INBOX is canonicalized
 	// to upper case in both directions (RFC 9051 §6.3.9 has the server match
 	// and report the uppercase spelling), so compare the canonical forms.
-	return internal.MatchList(data.Mailbox, data.Delim, canonicalMailbox(cmd.ref), canonicalMailbox(cmd.pattern))
+	ref, pattern := canonicalMailbox(cmd.ref), canonicalMailbox(cmd.pattern)
+	if internal.MatchList(data.Mailbox, data.Delim, ref, pattern) {
+		return true
+	}
+	if ref != "" && data.Delim != 0 {
+		delim := string(data.Delim)
+		if strings.HasSuffix(ref, delim) {
+			// A wildcard-leading pattern stays in the reference's hierarchy.
+			// Matching it against the whole name would absorb unrelated LIST
+			// notifications (e.g. INBOX while listing "Archive/" "*").
+			if pattern[0] == '*' || pattern[0] == '%' {
+				return false
+			}
+		} else {
+			// RFC 9051 §6.3.9 gives three interpretations of "foo/bar" +
+			// "rag/baz": the child path above, direct concatenation, or a
+			// path relative to "foo/". Accept the latter two as well. Strip
+			// the reference literally: its '*' and '%' are not wildcards.
+			prefixes := []string{ref}
+			if i := strings.LastIndex(ref, delim); i >= 0 {
+				prefixes = append(prefixes, ref[:i+len(delim)])
+			}
+			for _, prefix := range prefixes {
+				if suffix, ok := strings.CutPrefix(data.Mailbox, prefix); ok &&
+					internal.MatchPattern(suffix, data.Delim, pattern) {
+					return true
+				}
+			}
+		}
+	}
+	// Keep the pattern-only fallback for references without a trailing
+	// delimiter. RFC 9051 §6.3.9 leaves their interpretation to the server:
+	// resolving "Archive" relative to its parent can give an empty prefix,
+	// so "*" or "%" can legitimately match "INBOX". The prefix loop above
+	// cannot cover that empty parent. Rejecting wildcard-leading patterns
+	// here would lose valid replies; such replies cannot be distinguished
+	// from unsolicited notifications using these ambiguous arguments.
+	//
+	// Breakout characters are server-defined, so literal-leading patterns
+	// may override the reference. Do not restrict this to known /, ~ or #
+	// prefixes, or attempt to reproduce the server's full canonicalization.
+	return internal.MatchPattern(data.Mailbox, data.Delim, pattern)
 }
 
 // canonicalMailbox spells a mailbox name the way the encoder puts it on the

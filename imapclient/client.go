@@ -63,6 +63,8 @@ type SelectedMailbox struct {
 	NumMessages    uint32
 	Flags          []imap.Flag
 	PermanentFlags []imap.Flag
+	// ReadOnly indicates that the mailbox is read-only.
+	ReadOnly bool
 }
 
 func (mbox *SelectedMailbox) copy() *SelectedMailbox {
@@ -90,6 +92,17 @@ type Options struct {
 	// buffer in memory (e.g., for FetchMessageBuffer.Collect). Larger
 	// literals must be consumed via the streaming API. Default 64 MiB.
 	MaxLiteralSize int64
+	// MaxFetchBufferSize caps the combined literal payload buffered to route
+	// FETCH responses: BODY, BINARY and metadata read before its UID, plus
+	// metadata held until SELECT updates are complete. The cap covers every
+	// message not yet consumed: a response that would go over it waits until
+	// consumers free enough, as a streamed body waits for its reader. Zero
+	// or negative values use the default of 64 MiB. At most 4096 items may be
+	// buffered per response, including empty body sections.
+	// A single response exceeding the limit fails the connection and its
+	// pending commands. Responses with UID before their bodies keep streaming
+	// without this cap.
+	MaxFetchBufferSize int64
 	// ResponseTimeout bounds how long to wait for a response while a command
 	// is in flight, including the wait for its first byte. This is the window
 	// in which an unresponsive server is detected. If zero, 30 seconds is used.
@@ -151,6 +164,13 @@ func (options *Options) maxLiteralSize() int64 {
 	return 64 * 1024 * 1024 // 64 MiB default
 }
 
+func (options *Options) maxFetchBufferSize() int64 {
+	if options.MaxFetchBufferSize > 0 {
+		return options.MaxFetchBufferSize
+	}
+	return 64 * 1024 * 1024
+}
+
 func (options *Options) decodeText(s string) (string, error) {
 	wordDecoder := options.WordDecoder
 	if wordDecoder == nil {
@@ -209,8 +229,9 @@ type Client struct {
 	greetingRecv bool
 	greetingErr  error
 
-	decCh  chan struct{}
-	decErr error
+	decCh   chan struct{}
+	decErr  error
+	closeCh chan struct{} // closed by Close to interrupt FETCH delivery
 
 	mutex       sync.Mutex
 	state       imap.ConnState
@@ -226,6 +247,13 @@ type Client struct {
 	// the read deadline: once a response is being decoded the deadline belongs
 	// to the reader, which lengthens it for literals.
 	awaitingResp bool
+
+	// fetchBuf* account for the FETCH data buffered to route responses (see
+	// Options.MaxFetchBufferSize), summed over every message not yet
+	// consumed. fetchBufFreed is closed, and cleared, when bytes are released.
+	fetchBufMutex sync.Mutex
+	fetchBufInUse int64
+	fetchBufFreed chan struct{}
 }
 
 // New creates a new IMAP client.
@@ -255,6 +283,7 @@ func New(conn net.Conn, options *Options) *Client {
 		dec:        dec,
 		greetingCh: make(chan struct{}),
 		decCh:      make(chan struct{}),
+		closeCh:    make(chan struct{}),
 		state:      imap.ConnStateNone,
 		enabled:    make(imap.CapSet),
 	}
@@ -439,6 +468,15 @@ func (c *Client) setState(state imap.ConnState) {
 	c.mutex.Unlock()
 }
 
+func (c *Client) setMailboxReadOnly(readOnly bool) {
+	c.mutex.Lock()
+	if c.state == imap.ConnStateSelected {
+		c.mailbox = c.mailbox.copy()
+		c.mailbox.ReadOnly = readOnly
+	}
+	c.mutex.Unlock()
+}
+
 // Caps returns the capabilities advertised by the server.
 //
 // When the server hasn't sent the capability list, this method will request it
@@ -508,6 +546,9 @@ func (c *Client) Close() error {
 	c.mutex.Lock()
 	alreadyClosed := c.closed
 	c.closed = true
+	if !alreadyClosed {
+		close(c.closeCh)
+	}
 	c.mutex.Unlock()
 
 	// Ignore net.ErrClosed here, because we also call conn.Close in c.read
@@ -646,10 +687,6 @@ func findPendingCmdByType[T command](c *Client) T {
 }
 
 func (c *Client) completeCommand(cmd command, err error) {
-	done := cmd.base().done
-	done <- err
-	close(done)
-
 	// Ensure the command is not blocked waiting on continuation requests
 	c.mutex.Lock()
 	var filtered []continuationRequest
@@ -677,6 +714,7 @@ func (c *Client) completeCommand(cmd command, err error) {
 			c.mutex.Unlock()
 		}
 	case *SelectCommand:
+		var imapErr *imap.Error
 		if err == nil {
 			c.mutex.Lock()
 			c.state = imap.ConnStateSelected
@@ -685,6 +723,19 @@ func (c *Client) completeCommand(cmd command, err error) {
 				NumMessages:    cmd.data.NumMessages,
 				Flags:          cmd.data.Flags,
 				PermanentFlags: cmd.data.PermanentFlags,
+				ReadOnly:       cmd.data.ReadOnly,
+			}
+			c.mutex.Unlock()
+		} else if errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeNo {
+			// RFC 3501 §6.3.1, RFC 9051 §6.3.2: a SELECT or EXAMINE refused
+			// with NO leaves no mailbox selected, whether or not the server
+			// sent [CLOSED]. BAD rejects the command unread, so the mailbox
+			// stays selected. NO says nothing about authentication: only
+			// leave the selected state.
+			c.mutex.Lock()
+			if c.state == imap.ConnStateSelected {
+				c.state = imap.ConnStateAuthenticated
+				c.mailbox = nil
 			}
 			c.mutex.Unlock()
 		}
@@ -706,6 +757,12 @@ func (c *Client) completeCommand(cmd command, err error) {
 	case *ExpungeCommand:
 		close(cmd.seqNums)
 	}
+
+	// Wait must observe the final connection state, mailbox snapshot and
+	// closed result channels when it returns.
+	done := cmd.base().done
+	done <- err
+	close(done)
 }
 
 func (c *Client) registerContReq(cmd command) *imapwire.ContinuationRequest {
@@ -935,13 +992,12 @@ func (c *Client) readResponseTagged(tag, typ string) (startTLS *startTLSCommand,
 				// STORE + EXPUNGE
 				cmd.data = MoveData(data)
 			}
-		case "READ-ONLY": // RFC 3501 / RFC 4314 §5.2
+		case "READ-ONLY", "READ-WRITE": // RFC 9051 §7.1
+			readOnly := code == "READ-ONLY"
 			if cmd, ok := cmd.(*SelectCommand); ok {
-				cmd.data.ReadOnly = true
-			}
-		case "READ-WRITE":
-			if cmd, ok := cmd.(*SelectCommand); ok {
-				cmd.data.ReadOnly = false
+				cmd.data.ReadOnly = readOnly
+			} else {
+				c.setMailboxReadOnly(readOnly)
 			}
 		case "MODIFIED": // RFC 7162 §3.1.3: conditional STORE UNCHANGEDSINCE failures
 			if !c.dec.ExpectSP() {
@@ -1069,6 +1125,16 @@ func (c *Client) readResponseData(typ string) error {
 				} else if handler := c.options.unilateralDataHandler().Mailbox; handler != nil {
 					handler(&UnilateralDataMailbox{PermanentFlags: flags})
 				}
+			case "READ-ONLY", "READ-WRITE":
+				// RFC 9051 §7.1: besides answering SELECT, these report that the
+				// access to the selected mailbox has changed.
+				readOnly := code == "READ-ONLY"
+
+				c.setMailboxReadOnly(readOnly)
+
+				if cmd := findPendingCmdByType[*SelectCommand](c); cmd != nil {
+					cmd.data.ReadOnly = readOnly
+				}
 			case "UIDNEXT":
 				var num uint32
 				if !c.dec.SP() || !c.dec.Number(&num) {
@@ -1181,6 +1247,11 @@ func (c *Client) readResponseData(typ string) error {
 			return c.dec.Err()
 		}
 		return c.handleList()
+	case "LSUB":
+		if !c.dec.ExpectSP() {
+			return c.dec.Err()
+		}
+		return c.handleLsub()
 	case "STATUS":
 		if !c.dec.ExpectSP() {
 			return c.dec.Err()
@@ -1204,6 +1275,8 @@ func (c *Client) readResponseData(typ string) error {
 		return c.handleESearch()
 	case "SORT":
 		return c.handleSort()
+	case "ESORT":
+		return c.handleESort()
 	case "THREAD":
 		return c.handleThread()
 	case "METADATA":
@@ -1263,8 +1336,30 @@ func (c *Client) handleVanished() error {
 		return c.dec.Err()
 	}
 
-	// Check if there's a pending SELECT command
 	cmd := findPendingCmdByType[*SelectCommand](c)
+
+	// RFC 7162 §3.2.10.2: unlike VANISHED (EARLIER), a VANISHED response
+	// removes its messages from the selected mailbox, one per UID, as EXPUNGE
+	// does, and the server need not send EXISTS for the new count. A set with
+	// "*" names no countable number of messages, so it leaves the count alone.
+	if !data.Earlier && !data.UIDs.Dynamic() {
+		n := data.UIDs.Cardinality()
+		if cmd != nil {
+			// EXISTS records the pending selection's count before its tagged
+			// completion publishes c.mailbox. Live removals must adjust that
+			// count too. Any provisional old-mailbox count before CLOSED is
+			// replaced by the new selection's required EXISTS response.
+			cmd.data.NumMessages -= uint32(min(n, uint64(cmd.data.NumMessages)))
+		}
+
+		c.mutex.Lock()
+		if c.state == imap.ConnStateSelected {
+			c.mailbox = c.mailbox.copy()
+			c.mailbox.NumMessages -= uint32(min(n, uint64(c.mailbox.NumMessages)))
+		}
+		c.mutex.Unlock()
+	}
+
 	if cmd != nil && data.Earlier {
 		// VANISHED (EARLIER) during SELECT should populate SelectData.
 		// Accumulate: a resynchronization can arrive in more than one
@@ -1437,12 +1532,14 @@ type UnilateralDataMailbox struct {
 
 // UnilateralDataHandler handles unilateral data.
 //
-// The Fetch handler is invoked in a separate goroutine and will not block
-// the client. Other handlers (Expunge, Mailbox, Vanished) are invoked
-// synchronously and will block the client while running.
+// The Fetch handler is invoked in a separate goroutine. Reading further
+// responses can wait for it to consume message data or return. Other handlers
+// (Expunge, Mailbox, Vanished) are invoked synchronously and will block the
+// client while running.
 //
 // If the caller intends to perform slow operations in any handler, a buffered
-// channel and a separate goroutine should be used.
+// channel and a separate goroutine should be used. For Fetch, collect or copy
+// the needed data inside the callback and pass that data to the worker.
 //
 // These handlers are important when using the IDLE or NOTIFY commands, as the
 // server will send unsolicited STATUS, FETCH, and EXPUNGE responses for
@@ -1456,6 +1553,13 @@ type UnilateralDataHandler struct {
 	// Fetch is called for an unsolicited FETCH response, such as the flag
 	// update a NOTIFY FlagChange event produces for the selected mailbox
 	// (RFC 5465 §5.1).
+	//
+	// The message and its literal readers are valid only during the callback.
+	// Any unread data is discarded after it returns. Used afterwards, Next
+	// returns nil and Collect and the literal readers return an error. For
+	// asynchronous work, call msg.Collect inside the callback and pass the
+	// resulting buffer to the worker instead of handing off msg or its literal
+	// readers.
 	//
 	// One case is not routed here: a FETCH command is in flight and the
 	// notification concerns a message inside its set. Nothing distinguishes
