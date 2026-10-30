@@ -8,11 +8,8 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/internal"
-	"github.com/emersion/go-imap/v2/internal/imapnum"
 	"github.com/emersion/go-imap/v2/internal/imapwire"
 )
-
-const maxAllResultSize = 10_000_000
 
 func returnSearchOptions(options *imap.SearchOptions) []string {
 	if options == nil {
@@ -207,54 +204,50 @@ func (c *Client) handleSearch() error {
 }
 
 func (c *Client) handleESearch() error {
-	tag, data, allRaw, isUID, err := readESearchResponse(c.dec)
-	if err != nil {
+	// esearch-response = "ESEARCH" [search-correlator] [SP "UID"]
+	// *(SP search-return-data), and search-correlator = SP "(" ... ")". All
+	// of it is optional, and one byte of lookahead cannot tell the
+	// correlator's SP from the next item's, so read the SP here and tell the
+	// readers below whether they still have to.
+	data := &imap.SearchData{}
+	var tag string
+	spRead := c.dec.SP()
+	if spRead && c.dec.NextByteIs('(') {
+		var err error
+		if tag, err = readSearchCorrelator(c.dec, data); err != nil {
+			return err
+		}
+		spRead = false
+	}
+	// RFC 4466 section 2.6.2 and RFC 9051 section 7.3.4: without a
+	// correlator the response was not caused by a particular command, even
+	// if only one command is pending. Still parse it to consume the response.
+	var cmd command
+	if tag != "" {
+		cmd = c.findPendingCmdFunc(func(cmd command) bool {
+			switch cmd.(type) {
+			case *SearchCommand, *MultiSearchCommand, *SortCommand:
+				return cmd.base().tag == tag
+			default:
+				return false
+			}
+		})
+	}
+	if sortCmd, ok := cmd.(*SortCommand); ok {
+		// RFC 5267 §3.1: an extended SORT is answered with ESEARCH too. Its ALL
+		// is in sort order, which a SearchData cannot hold, so it is read the
+		// way an ESORT response is.
+		return c.readESortData(sortCmd, spRead)
+	}
+	if err := readESearchReturnData(c.dec, data, spRead); err != nil {
 		return err
 	}
-	cmd := c.findPendingCmdFunc(func(anyCmd command) bool {
-		switch cmd := anyCmd.(type) {
-		case *SearchCommand:
-			if tag != "" {
-				return cmd.tag == tag
-			}
-			return true
-		case *MultiSearchCommand:
-			if tag != "" {
-				return cmd.tag == tag
-			}
-			return true
-		case *SortCommand:
-			if tag != "" {
-				return cmd.tag == tag
-			}
-			return true
-		}
-		return false
-	})
 	if cmd != nil {
 		switch cmd := cmd.(type) {
 		case *SearchCommand:
 			cmd.data = *data
 		case *MultiSearchCommand:
 			cmd.data = append(cmd.data, data)
-		case *SortCommand:
-			cmd.data.Min = data.Min
-			cmd.data.Max = data.Max
-			cmd.data.Count = data.Count
-			if allRaw != "" {
-				nums, err := imapnum.ParseOrderedNums(allRaw, maxAllResultSize)
-				if err != nil {
-					return err
-				}
-				if isUID || cmd.numKind == imapwire.NumKindUID {
-					cmd.data.UIDs = make([]imap.UID, len(nums))
-					for i, n := range nums {
-						cmd.data.UIDs[i] = imap.UID(n)
-					}
-				} else {
-					cmd.data.SeqNums = nums
-				}
-			}
 		}
 	}
 	return nil
@@ -401,83 +394,88 @@ func flagSearchKey(flag imap.Flag) string {
 	}
 }
 
-func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchData, allRaw string, isUID bool, err error) {
-	data = &imap.SearchData{}
-	if !dec.SP() {
-		return "", data, "", false, nil
-	}
+// readSearchCorrelator reads the search-correlator of an ESEARCH response, if
+// there is one, into data and returns its TAG. The caller needs the tag to
+// find the command before it can tell how to read the rest: see handleESearch.
+func readSearchCorrelator(dec *imapwire.Decoder, data *imap.SearchData) (tag string, err error) {
 	if dec.Special('(') { // search-correlator
 		// RFC 7377 §2.1: the correlator carries TAG plus, for multi-mailbox
 		// results, MAILBOX and UIDVALIDITY — all inside the same parentheses.
 		for {
 			var itemName string
 			if !dec.ExpectAtom(&itemName) || !dec.ExpectSP() {
-				return "", nil, "", false, dec.Err()
+				return "", dec.Err()
 			}
 			switch strings.ToUpper(itemName) {
 			case "TAG":
 				if !dec.ExpectAString(&tag) {
-					return "", nil, "", false, dec.Err()
+					return "", dec.Err()
 				}
 			case "MAILBOX":
 				if !dec.ExpectMailbox(&data.Mailbox) {
-					return "", nil, "", false, dec.Err()
+					return "", dec.Err()
 				}
 			case "UIDVALIDITY":
 				if !dec.ExpectNumber(&data.UIDValidity) {
-					return "", nil, "", false, dec.Err()
+					return "", dec.Err()
 				}
 			default:
-				return "", nil, "", false, fmt.Errorf("in search-correlator: unknown item %q", itemName)
+				return "", fmt.Errorf("in search-correlator: unknown item %q", itemName)
 			}
 			if !dec.SP() {
 				break
 			}
 		}
 		if !dec.ExpectSpecial(')') {
-			return "", nil, "", false, dec.Err()
-		}
-		if !dec.SP() {
-			return tag, data, "", false, nil
+			return "", dec.Err()
 		}
 	}
+	return tag, nil
+}
 
+// readESearchReturnData reads the return data that follows the
+// search-correlator of an ESEARCH response.
+//
+// spRead reports that the SP in front of the first item has been read.
+func readESearchReturnData(dec *imapwire.Decoder, data *imap.SearchData, spRead bool) error {
 	var name string
-	if !dec.ExpectAtom(&name) {
-		return "", nil, "", false, dec.Err()
+	if !spRead && !dec.SP() {
+		return nil
+	} else if !dec.ExpectAtom(&name) {
+		return dec.Err()
 	}
-	isUID = strings.EqualFold(name, "UID")
+	isUID := name == "UID"
 
 	if isUID {
 		if !dec.SP() {
-			return tag, data, "", true, nil
+			return nil
 		} else if !dec.ExpectAtom(&name) {
-			return "", nil, "", false, dec.Err()
+			return dec.Err()
 		}
 	}
 
 	for {
 		if !dec.ExpectSP() {
-			return "", nil, "", false, dec.Err()
+			return dec.Err()
 		}
 
 		switch strings.ToUpper(name) {
 		case "MAILBOX":
 			var mbox string
 			if !dec.ExpectMailbox(&mbox) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 			data.Mailbox = mbox
 		case "MIN":
 			var num uint32
 			if !dec.ExpectNumber(&num) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 			data.Min = num
 		case "MAX":
 			var num uint32
 			if !dec.ExpectNumber(&num) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 			data.Max = num
 		case "ALL":
@@ -487,12 +485,13 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 			}
 			// The loop's own ExpectSP above already consumed the SP between
 			// "ALL" and the sequence-set; do not read a second one here.
-			if !dec.ExpectNumSetRaw(numKind, &data.All, &allRaw) {
-				return "", nil, "", false, dec.Err()
+			if !dec.ExpectNumSet(numKind, &data.All) {
+				return dec.Err()
 			}
 			if data.All.Dynamic() {
-				return "", nil, "", false, fmt.Errorf("imapclient: server returned a dynamic ALL number set in SEARCH response")
+				return fmt.Errorf("imapclient: server returned a dynamic ALL number set in SEARCH response")
 			}
+			const maxAllResultSize = 10_000_000
 			var cardinality uint64
 			switch set := data.All.(type) {
 			case imap.SeqSet:
@@ -501,25 +500,25 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 				cardinality = set.Cardinality()
 			}
 			if cardinality > maxAllResultSize {
-				return "", nil, "", false, fmt.Errorf("imapclient: server returned ALL set with %d entries (cap %d)", cardinality, maxAllResultSize)
+				return fmt.Errorf("imapclient: server returned ALL set with %d entries (cap %d)", cardinality, maxAllResultSize)
 			}
 		case "COUNT":
 			var num uint32
 			if !dec.ExpectNumber(&num) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 			data.Count = num
 		case "MODSEQ":
-			// RFC 7162 §3.4: MODSEQ appears as a bare "MODSEQ <value>" item
-			// in an ESEARCH response.
+			// RFC 4731 §3.2: MODSEQ appears as a bare "MODSEQ <value>" item
+			// in an ESEARCH response (required by RFC 7162 §3.1.10).
 			var modSeq uint64
 			if !dec.ExpectModSeq(&modSeq) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 			data.ModSeq = modSeq
 		default:
 			if !dec.DiscardValue() {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 		}
 
@@ -531,32 +530,32 @@ func readESearchResponse(dec *imapwire.Decoder) (tag string, data *imap.SearchDa
 			// "MODSEQ n".  Accept both forms.
 			var atomName string
 			if !dec.ExpectAtom(&atomName) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 			if strings.ToUpper(atomName) == "MODSEQ" {
 				var modSeq uint64
 				if !dec.ExpectSP() || !dec.ExpectModSeq(&modSeq) || !dec.ExpectSpecial(')') {
-					return "", nil, "", false, dec.Err()
+					return dec.Err()
 				}
 				data.ModSeq = modSeq
 			} else {
 				// Unknown parenthesized item, skip it
 				if !dec.DiscardValue() || !dec.ExpectSpecial(')') {
-					return "", nil, "", false, dec.Err()
+					return dec.Err()
 				}
 			}
 			// Continue to check for more items
 			if !dec.SP() {
 				break
 			} else if !dec.ExpectAtom(&name) {
-				return "", nil, "", false, dec.Err()
+				return dec.Err()
 			}
 		} else if !dec.ExpectAtom(&name) {
-			return "", nil, "", false, dec.Err()
+			return dec.Err()
 		}
 	}
 
-	return tag, data, allRaw, isUID, nil
+	return nil
 }
 
 func searchCriteriaIsASCII(criteria *imap.SearchCriteria) bool {

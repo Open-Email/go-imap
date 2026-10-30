@@ -1,6 +1,7 @@
 package imapserver
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,7 +13,7 @@ import (
 	"golang.org/x/text/language"
 )
 
-func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) error {
+func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) (err error) {
 	if !dec.ExpectSP() {
 		return dec.Err()
 	}
@@ -21,6 +22,15 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 		options  imap.SearchOptions
 		extended bool
 	)
+	backendCalled := false
+	defer func() {
+		if !backendCalled {
+			err = c.failSearchBeforeBackend(err, &options, func() error {
+				_, badErr := c.checkSearchReturnOpts(&options)
+				return badErr
+			})
+		}
+	}()
 	if maybeReadSearchKeyAtom(dec, &atom) && strings.EqualFold(atom, "RETURN") {
 		if err := readSearchReturnOpts(dec, &options); err != nil {
 			return fmt.Errorf("in search-return-opts: %w", err)
@@ -32,21 +42,13 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 		atom = ""
 		maybeReadSearchKeyAtom(dec, &atom)
 	}
+	var badCharset bool
 	if strings.EqualFold(atom, "CHARSET") {
 		var charset string
 		if !dec.ExpectSP() || !dec.ExpectAString(&charset) || !dec.ExpectSP() {
 			return dec.Err()
 		}
-		switch strings.ToUpper(charset) {
-		case "US-ASCII", "UTF-8":
-			// nothing to do
-		default:
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeBadCharset, // TODO: return list of supported charsets
-				Text: "Only US-ASCII and UTF-8 are supported SEARCH charsets",
-			}
-		}
+		badCharset = !searchCharsetSupported(charset)
 		atom = ""
 		maybeReadSearchKeyAtom(dec, &atom)
 	}
@@ -76,23 +78,42 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 	if err := c.checkState(imap.ConnStateSelected); err != nil {
 		return err
 	}
+	supportsESEARCH, err := c.checkSearchReturnOpts(&options)
+	if err != nil {
+		return err
+	}
+	if badCharset {
+		return badSearchCharsetError()
+	}
 
-	// If no return option is specified, ALL is assumed
+	// SAVE alone suppresses result responses (RFC 5182 §1, RFC 9051 §6.4.4).
+	// Capture that before normalizing options: the backend still receives ALL
+	// so it computes and saves the full match set, as it did before.
+	saveOnly := options.ReturnSave && !options.ReturnMin && !options.ReturnMax && !options.ReturnAll && !options.ReturnCount
+	// If no output option is specified, ALL is assumed for the backend.
 	if !options.ReturnMin && !options.ReturnMax && !options.ReturnAll && !options.ReturnCount {
 		options.ReturnAll = true
 	}
 
+	// Read before the session can rewrite the criteria. readSearchKey keeps a
+	// MODSEQ key only when CONDSTORE is supported.
+	hasModSeq := searchCriteriaHasModSeq(&criteria)
+
+	backendCalled = true
 	data, err := c.session.Search(c.ctx, numKind, &criteria, &options)
 	if err != nil {
 		return err
 	}
+	if saveOnly {
+		return nil
+	}
 
-	var supportsESEARCH bool
-	if capSession, ok := c.session.(SessionCapabilities); ok {
-		sessionCaps := capSession.GetCapabilities()
-		supportsESEARCH = sessionCaps.Has(imap.CapESearch) || sessionCaps.Has(imap.CapIMAP4rev2)
-	} else {
-		supportsESEARCH = c.availableCapsSet().Has(imap.CapESearch) || c.availableCapsSet().Has(imap.CapIMAP4rev2)
+	// RFC 7162 §3.1.5 and §3.1.6: the response carries the highest
+	// mod-sequence of the result only when the criteria use MODSEQ, as for
+	// SORT (handleSort). A client that did not ask cannot be expected to
+	// parse it.
+	if !hasModSeq {
+		data.ModSeq = 0
 	}
 
 	// Use the ESEARCH format when the session supports it AND either the client
@@ -110,12 +131,17 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 	// rev2-only client with no results at all — §6.4.4 tells it to ignore
 	// SEARCH responses, so the mismatch is silent rather than a parse error.
 	//
+	// The rule is SEARCH's alone: RFC 9051 does not touch SORT, whose plain
+	// form keeps the SORT response of RFC 5256 in either revision (sort.go).
+	//
 	// Gating on the ENABLED set, never the advertised one, is what keeps this
 	// invisible to IMAP4rev1 clients: a server may advertise IMAP4rev2 alongside
 	// IMAP4rev1, and a client that never sent ENABLE keeps receiving the rev1
 	// wire form it knows how to parse. supportsESEARCH is kept as the outer
 	// guard so the response form can never outrun what the session reports it
-	// can do via SessionCapabilities.
+	// can do via SessionCapabilities. It is the value read before Search ran,
+	// which accepted the result options: RFC 4731 §3.1 answers those with
+	// ESEARCH even if the session's capabilities changed since.
 	if supportsESEARCH && (extended || c.isIMAP4rev2()) {
 		return c.writeESearch(tag, data, &options, numKind)
 	} else {
@@ -190,6 +216,7 @@ func (c *Conn) writeSearch(numSet imap.NumSet, modSeq uint64) error {
 
 	enc.Atom("*").SP().Atom("SEARCH")
 
+	written := 0
 	if numSet != nil {
 		var ok bool
 		switch numSet := numSet.(type) {
@@ -199,22 +226,25 @@ func (c *Conn) writeSearch(numSet imap.NumSet, modSeq uint64) error {
 			for _, num := range nums {
 				enc.SP().Number(num)
 			}
+			written = len(nums)
 		case imap.UIDSet:
 			var uids []imap.UID
 			uids, ok = numSet.Nums()
 			for _, uid := range uids {
 				enc.SP().UID(uid)
 			}
+			written = len(uids)
 		}
 		if !ok {
 			return fmt.Errorf("imapserver: failed to enumerate message numbers in SEARCH response (dynamic set?)")
 		}
 	}
 
-	// RFC 7162 §3.4: append the highest mod-sequence of the matched messages to
-	// the untagged SEARCH response, e.g. "* SEARCH 2 5 6 (MODSEQ 917162500)".
-	// Gated identically to the ESEARCH path (writeESearch).
-	if modSeq > 0 && c.supportsCondStore() {
+	// RFC 7162 §3.1.5: append the highest mod-sequence of the matched messages
+	// to the untagged SEARCH response, e.g. "* SEARCH 2 5 6 (MODSEQ 917162500)".
+	// Unlike the ESEARCH path (writeESearch), RFC 7162 §7 allows it only after
+	// at least one number, as writeSort does.
+	if modSeq > 0 && written > 0 && c.supportsCondStore() {
 		enc.SP().Special('(').Atom("MODSEQ").SP().ModSeq(modSeq).Special(')')
 	}
 
@@ -242,10 +272,75 @@ func readSearchReturnOpts(dec *imapwire.Decoder, options *imap.SearchOptions) er
 		case "SAVE":
 			options.ReturnSave = true
 		default:
-			// RFC 4731: A server MUST ignore any unrecognized return options.
+			// RFC 4466 §2.6.1 requires rejecting unsupported result options.
+			return newClientBugError(fmt.Sprintf("Unknown SEARCH return option: %q", name))
 		}
 		return nil
 	})
+}
+
+func searchCharsetSupported(charset string) bool {
+	switch strings.ToUpper(charset) {
+	case "US-ASCII", "UTF-8":
+		return true
+	default:
+		return false
+	}
+}
+
+// checkSearchReturnOpts rejects the result options of a SEARCH that the
+// server does not support. It reports the ESEARCH support it checked them
+// against, which handleSearch keeps to choose the response form.
+//
+// RFC 4466 §2.6.1: "Any options not defined by extensions that the server
+// supports must be rejected with a BAD response." The result options are
+// ESEARCH's (RFC 4731), SAVE included: a SEARCHRES server "MUST also implement
+// the [ESEARCH] extension" (RFC 5182 §2.1). The session cannot do this itself,
+// since a plain SEARCH reaches it as RETURN (ALL) (handleSearch). An empty
+// RETURN () holds no option and gets the SEARCH response.
+func (c *Conn) checkSearchReturnOpts(options *imap.SearchOptions) (supportsESEARCH bool, err error) {
+	supportsESEARCH = c.supportsESearch()
+	if !supportsESEARCH && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave) {
+		return false, newClientBugError("SEARCH result options require ESEARCH")
+	}
+	if options.ReturnSave && !c.supportsSearchRes() {
+		return false, newClientBugError("SEARCH SAVE requires SEARCHRES")
+	}
+	return supportsESEARCH, nil
+}
+
+// failSearchBeforeBackend settles a SEARCH or ESEARCH that fails before Search
+// or MultiSearch runs. Once the backend is called, it owns resets.
+//
+// A SAVE search answered NO empties "$"; BAD and searches without SAVE leave
+// it unchanged (RFC 5182 section 2.1). A NO raised while the command is still
+// being read, such as a refused literal, comes before the checks that answer
+// BAD. IN and RETURN precede the search program, so checkBAD can still run
+// those checks on what was read; if one rejects the SAVE, the command gets
+// that BAD instead of the NO.
+func (c *Conn) failSearchBeforeBackend(err error, options *imap.SearchOptions, checkBAD func() error) error {
+	var imapErr *imap.Error
+	if !options.ReturnSave || c.state != imap.ConnStateSelected ||
+		!errors.As(err, &imapErr) || imapErr.Type != imap.StatusResponseTypeNo {
+		return err
+	}
+	if badErr := checkBAD(); badErr != nil {
+		return badErr
+	}
+	if sess, ok := c.session.(SessionSearchRes); ok {
+		sess.ResetSearchRes()
+	}
+	return err
+}
+
+// The handlers defer BADCHARSET until the command has been parsed and checked
+// for BAD errors, which must preserve the saved search result.
+func badSearchCharsetError() error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeBadCharset, // TODO: return list of supported charsets
+		Text: "Only US-ASCII and UTF-8 are supported SEARCH charsets",
+	}
 }
 
 func maybeReadSearchKeyAtom(dec *imapwire.Decoder, ptr *string) bool {

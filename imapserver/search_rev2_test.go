@@ -80,8 +80,19 @@ func newSearchRev2ConnWrapped(t *testing.T, caps imap.CapSet, wrap func(imapserv
 	return rc
 }
 
-// do sends one command and returns the whole response, tagged line included.
+// do sends one command, requires it to complete OK, and returns the whole
+// response, tagged line included.
 func (rc *searchRev2Conn) do(cmd string) string {
+	rc.t.Helper()
+	resp, tagged := rc.try(cmd)
+	if !strings.Contains(tagged, " OK ") {
+		rc.t.Fatalf("%s → %s", cmd, strings.TrimRight(tagged, "\r\n"))
+	}
+	return resp
+}
+
+// try is do without the OK requirement; it also returns the tagged line.
+func (rc *searchRev2Conn) try(cmd string) (resp, tagged string) {
 	rc.t.Helper()
 	rc.seq++
 	tag := "t" + strconv.Itoa(rc.seq)
@@ -93,11 +104,7 @@ func (rc *searchRev2Conn) do(cmd string) string {
 		line, err := rc.br.ReadString('\n')
 		buf.WriteString(line)
 		if strings.HasPrefix(line, tag+" ") {
-			resp := buf.String()
-			if !strings.Contains(line, " OK ") {
-				rc.t.Fatalf("%s → %s", cmd, strings.TrimRight(line, "\r\n"))
-			}
-			return resp
+			return buf.String(), line
 		}
 		if err != nil {
 			rc.t.Fatalf("reading response to %q: %v (got %q)", cmd, err, buf.String())
@@ -420,10 +427,10 @@ func TestESortTagCorrelatorIsString(t *testing.T) {
 }
 
 // RFC 9051 §6.4.4 deprecates only the SEARCH response; it does not touch SORT
-// (RFC 5256). A client that has ENABLEd IMAP4rev2 (or connects to a rev2-only
-// server) and sends a plain SORT or UID SORT without a RETURN clause must still
-// receive * SORT, never * ESEARCH or * ESORT.
-func TestSortRev2PlainSortKeepsSortResponse(t *testing.T) {
+// (RFC 5256). A client that has ENABLEd IMAP4rev2 and sends a plain UID SORT
+// without a RETURN clause must still receive * SORT, never * ESEARCH or * ESORT.
+// TestSortRev2PlainSortKeepsSortResponse covers SORT itself.
+func TestSortRev2PlainUIDSortKeepsSortResponse(t *testing.T) {
 	rc := newSearchRev2Conn(t, imap.CapSet{
 		imap.CapIMAP4rev1: {},
 		imap.CapIMAP4rev2: {},
@@ -436,7 +443,6 @@ func TestSortRev2PlainSortKeepsSortResponse(t *testing.T) {
 	rc.do("SELECT INBOX")
 
 	for _, cmd := range []string{
-		"SORT (ARRIVAL) UTF-8 ALL",
 		"UID SORT (ARRIVAL) UTF-8 ALL",
 	} {
 		resp := rc.do(cmd)

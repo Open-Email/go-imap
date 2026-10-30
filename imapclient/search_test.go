@@ -127,7 +127,9 @@ func TestMultiSearch(t *testing.T) {
 // RFC 4731 §3.1:
 // esearch-response = "ESEARCH" [search-correlator] [SP "UID"] *(SP search-return-data)
 // Both correlated and uncorrelated ESEARCH responses (with or without UID and
-// with or without return data items) are valid on the wire.
+// with or without return data items) are valid on the wire. An uncorrelated
+// one was not caused by the pending command (RFC 4466 §2.6.2), so it must be
+// read without desynchronising the stream and without landing in its result.
 func TestESearchWire(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -167,7 +169,6 @@ func TestESearchWire(t *testing.T) {
 			wireLine: func(tag string) string {
 				return "* ESEARCH UID ALL 1:2\r\n"
 			},
-			wantUIDs: []imap.UID{1, 2},
 		},
 		{
 			name: "uncorrelated UID with MIN MAX COUNT",
@@ -175,9 +176,6 @@ func TestESearchWire(t *testing.T) {
 			wireLine: func(tag string) string {
 				return "* ESEARCH UID MIN 1 MAX 2 COUNT 2\r\n"
 			},
-			wantMin: 1,
-			wantMax: 2,
-			wantCnt: 2,
 		},
 		{
 			name: "uncorrelated UID empty",
@@ -192,7 +190,6 @@ func TestESearchWire(t *testing.T) {
 			wireLine: func(tag string) string {
 				return "* ESEARCH ALL 1:2\r\n"
 			},
-			wantSeqs: []uint32{1, 2},
 		},
 		{
 			name: "uncorrelated seqnum empty",
@@ -266,6 +263,9 @@ func TestESearchWire(t *testing.T) {
 				if !reflect.DeepEqual(got, tc.wantUIDs) {
 					t.Errorf("UIDs = %v, want %v", got, tc.wantUIDs)
 				}
+			}
+			if tc.wantUIDs == nil && tc.wantSeqs == nil && data.All != nil && data.All.String() != "" {
+				t.Errorf("SearchData.All = %v, want empty", data.All)
 			}
 			if tc.wantSeqs != nil {
 				seqSet, ok := data.All.(imap.SeqSet)
