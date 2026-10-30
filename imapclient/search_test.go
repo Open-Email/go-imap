@@ -284,4 +284,3 @@ func TestESearchWire(t *testing.T) {
 		})
 	}
 }
-

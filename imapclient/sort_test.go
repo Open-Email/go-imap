@@ -412,4 +412,3 @@ func TestESortWire(t *testing.T) {
 		})
 	}
 }
-
